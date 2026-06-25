@@ -1,0 +1,12 @@
+\resumeProject
+      {\textbf{\href{https://github.com/yourusername/raftlite}
+{RaftLite}} $|$ \emph{Go, Rust, Python, Raft Consensus, gRPC, Apache Arrow, Docker, Prometheus, DST}}{}      {2026}
+
+      \resumeItemListStart
+        \item{\textbf{Achieved} \textbf{25,000 req/s per node} with \textbf{p99 latency under 1.8ms} by hand-writing a Raft consensus engine in Go from scratch (3,000 LOC) with mockable I/O interfaces enabling \textbf{Deterministic Simulation Testing} across 10,000+ concurrent failure interleavings.}
+        \item{\textbf{Guaranteed} cluster safety during membership changes by implementing the \textbf{full Joint Consensus protocol} (C$_{\text{OLD,NEW}} \to$ C$_{\text{NEW}}$) from the Raft dissertation, preventing split-brain without relying on any third-party consensus library.}
+        \item{\textbf{Eliminated} Go GC latency spikes from the telemetry pipeline by routing data through a separate \textbf{Rust sidecar} with a lock-free \textbf{SPSC ring buffer} and \textbf{zero-copy Apache Arrow IPC} over POSIX shared memory.}
+        \item{\textbf{Reproduced} every distributed systems Heisenbug deterministically by abstracting \texttt{Clock}, \texttt{Network}, and \texttt{Storage} behind seeded-mock interfaces — a \textbf{single integer seed} replays exact interleavings of packet loss, clock drift, disk stalls, and node crashes.}
+        \item{\textbf{Detected} volumetric and low-and-slow attacks in real time by feeding arrow-batched telemetry into a \textbf{streaming Isolation Forest model} running on isolated CPU cores, with a \textbf{gRPC loopback} that injects blocks into the Raft log for strong-consistent replication across all nodes.}
+        \item{\textbf{Isolated} cross-plane latency interference by \textbf{pinning each execution plane to dedicated CPU cores} via \texttt{taskset} — a Python ML inference spike cannot starve a Raft heartbeat or corrupt Rust's lock-free ingestion.}
+      \resumeItemListEnd
