@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package raftlite;
+
+option go_package = "github.com/shadil/raftlite/api/go/loopbackpb";
+
+import "api/raft.proto";
+
+service Loopback {
+  rpc AddBlock(AddBlockRequest) returns (AddBlockResponse);
+}
