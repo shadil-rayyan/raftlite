@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -61,6 +62,18 @@ func main() {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]any{"acked": true, "index": idx})
+	})
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprintf(w, "# HELP raftlite_requests_total Total requests processed\n")
+		fmt.Fprintf(w, "# TYPE raftlite_requests_total counter\n")
+		fmt.Fprintf(w, "raftlite_requests_total 0\n")
+		fmt.Fprintf(w, "# HELP raftlite_elections_total Total leader elections\n")
+		fmt.Fprintf(w, "# TYPE raftlite_elections_total counter\n")
+		fmt.Fprintf(w, "raftlite_elections_total 0\n")
+		fmt.Fprintf(w, "# HELP raftlite_blocklist_size Current blocklist size\n")
+		fmt.Fprintf(w, "# TYPE raftlite_blocklist_size gauge\n")
+		fmt.Fprintf(w, "raftlite_blocklist_size 0\n")
 	})
 	mux.HandleFunc("GET /blocked/{ip}", func(w http.ResponseWriter, r *http.Request) {
 		ip := r.PathValue("ip")

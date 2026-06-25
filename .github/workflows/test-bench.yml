@@ -1,0 +1,55 @@
+name: Test & Bench
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Go build
+        run: go build ./...
+
+      - name: Go test
+        run: go test ./... -count=1 -short
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Rust build
+        run: cd telemetry-drain && cargo build
+
+      - name: Rust test
+        run: cd telemetry-drain && cargo test
+
+      - name: Python syntax check
+        run: python3 -m py_compile ai-engine/main.py ai-engine/models/*.py
+
+      - name: Docker build
+        run: docker build -t raftlite:test .
+
+  deterministic-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: DST harness
+        run: go test ./internal/transport/... -run TestDSTDeterminism -v

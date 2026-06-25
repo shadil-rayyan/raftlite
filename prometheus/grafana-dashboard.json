@@ -1,0 +1,20 @@
+{
+  "title": "RaftLite Cluster",
+  "panels": [
+    {
+      "title": "Requests per Second",
+      "type": "graph",
+      "targets": [{"expr": "rate(raftlite_requests_total[1m])"}]
+    },
+    {
+      "title": "Raft Leader Elections",
+      "type": "graph",
+      "targets": [{"expr": "rate(raftlite_elections_total[1m])"}]
+    },
+    {
+      "title": "Blocklist Size",
+      "type": "graph",
+      "targets": [{"expr": "raftlite_blocklist_size"}]
+    }
+  ]
+}
