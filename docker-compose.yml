@@ -1,0 +1,93 @@
+version: "3.9"
+
+x-common-go: &common-go
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  volumes:
+    - /dev/shm:/dev/shm
+  cap_add:
+    - SYS_PTRACE
+  networks:
+    - raftnet
+
+services:
+  node1:
+    <<: *common-go
+    ports:
+      - "8081:8080"
+      - "9091:9090"
+    environment:
+      NODE_ID: node1
+      RAFT_ADDR: :9090
+      RAFTLITE_ADDR: :8080
+      PEERS: node1,node2,node3
+      WAL_PATH: /data/raftlite.wal
+    volumes:
+      - wal1:/data
+    cpuset: "0"
+
+  node2:
+    <<: *common-go
+    ports:
+      - "8082:8080"
+      - "9092:9090"
+    environment:
+      NODE_ID: node2
+      RAFT_ADDR: :9090
+      RAFTLITE_ADDR: :8080
+      PEERS: node1,node2,node3
+      WAL_PATH: /data/raftlite.wal
+    volumes:
+      - wal2:/data
+    cpuset: "1"
+
+  node3:
+    <<: *common-go
+    ports:
+      - "8083:8080"
+      - "9093:9090"
+    environment:
+      NODE_ID: node3
+      RAFT_ADDR: :9090
+      RAFTLITE_ADDR: :8080
+      PEERS: node1,node2,node3
+      WAL_PATH: /data/raftlite.wal
+    volumes:
+      - wal3:/data
+    cpuset: "2"
+
+  telemetry-drain:
+    build:
+      context: telemetry-drain
+      dockerfile: Dockerfile.rust
+    restart: unless-stopped
+    volumes:
+      - /dev/shm:/dev/shm
+      - /tmp:/tmp
+    network_mode: "host"
+    cpuset: "3"
+
+  ai-engine:
+    build:
+      context: ai-engine
+      dockerfile: Dockerfile.python
+    restart: unless-stopped
+    volumes:
+      - /dev/shm:/dev/shm
+    network_mode: "host"
+    cpuset: "4"
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+volumes:
+  wal1:
+  wal2:
+  wal3:
+
+networks:
+  raftnet:
+    driver: bridge

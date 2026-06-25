@@ -40,8 +40,8 @@ func TestProposeToLeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Propose failed: %v", err)
 	}
-	if n.fsm.IsBlocked("1.2.3.4") {
-		t.Fatal("expected block before apply")
+	if !n.fsm.IsBlocked("1.2.3.4") {
+		t.Fatal("expected block after commit")
 	}
 	n.Stop()
 }

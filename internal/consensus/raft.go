@@ -210,6 +210,7 @@ func (n *Node) Propose(data []byte) (uint64, error) {
 	n.matchIndex[n.id] = entry.Index
 	n.nextIndex[n.id] = entry.Index + 1
 	n.broadcastAppendEntries()
+	n.updateCommitIndex()
 	return entry.Index, nil
 }
 
