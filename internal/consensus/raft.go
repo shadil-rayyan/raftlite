@@ -20,6 +20,19 @@ const (
 	Leader    NodeState = 2
 )
 
+func (s NodeState) String() string {
+	switch s {
+	case Follower:
+		return "follower"
+	case Candidate:
+		return "candidate"
+	case Leader:
+		return "leader"
+	default:
+		return "unknown"
+	}
+}
+
 type LogEntry struct {
 	Index uint64
 	Term  uint64
