@@ -23,6 +23,8 @@ services:
       RAFT_ADDR: :9090
       RAFTLITE_ADDR: :8080
       PEERS: node1,node2,node3
+      PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
+      ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal1:/data
@@ -38,6 +40,8 @@ services:
       RAFT_ADDR: :9090
       RAFTLITE_ADDR: :8080
       PEERS: node1,node2,node3
+      PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
+      ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal2:/data
@@ -53,6 +57,8 @@ services:
       RAFT_ADDR: :9090
       RAFTLITE_ADDR: :8080
       PEERS: node1,node2,node3
+      PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
+      ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal3:/data

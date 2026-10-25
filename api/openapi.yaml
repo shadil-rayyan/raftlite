@@ -1,0 +1,359 @@
+openapi: 3.0.3
+info:
+  title: RaftLite Admin API
+  description: |
+    Administrative API for the RaftLite security-policy control plane
+    (SRS §6.1). Writes are replicated through Raft and are only accepted by
+    the leader; followers answer 307 with the leader's location (FR-007).
+
+    Outcome semantics (PRD §13.1, SRS §8):
+      - `201/200` with `"status": "committed"` — the entry is committed.
+      - `504` with `"error": "outcome_uncertain"` — commit not confirmed
+        before the wait deadline; the write may still commit. Retry with the
+        same `request_id` to recover the outcome. A timeout is never reported
+        as a rejection.
+      - `307` — this node is not the leader; resend to `Location`.
+      - `503` with `"error": "no_leader"` — no elected leader; retry later.
+  version: 0.2.0
+servers:
+  - url: http://localhost:8080
+    description: Single node (dev)
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      description: The process is up. Never reflects cluster state.
+      security: []
+      responses:
+        "200":
+          description: Process alive
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /readyz:
+    get:
+      summary: Readiness probe
+      description: |
+        Reports whether this node can serve its role. `write_ready` is true
+        only on the leader (FR-028); followers are ready for reads.
+      security: []
+      responses:
+        "200":
+          description: Node is ready for its current role
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, node_id, role, write_ready]
+                properties:
+                  status: { type: string, example: ready }
+                  node_id: { type: string, example: node1 }
+                  role: { type: string, enum: [leader, follower, candidate] }
+                  write_ready: { type: boolean }
+
+  /v1/leader:
+    get:
+      summary: Current leader
+      responses:
+        "200":
+          description: Leader identity (may be empty during an election)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  leader_id: { type: string, example: node2 }
+                  node_id: { type: string, example: node1 }
+
+  /v1/cluster:
+    get:
+      summary: Cluster membership and replication view
+      responses:
+        "200":
+          description: Cluster state as seen by this node
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  node_id: { type: string }
+                  role: { type: string, enum: [leader, follower, candidate] }
+                  leader_id: { type: string }
+                  peers:
+                    type: array
+                    items: { type: string }
+                  revision:
+                    type: integer
+                    format: int64
+                    description: Last applied Raft log index in the state machine
+
+  /v1/policies:
+    get:
+      summary: List policies
+      parameters:
+        - in: query
+          name: include_inactive
+          schema: { type: string, enum: ["1"] }
+          description: Include revoked and expired policies.
+      responses:
+        "200":
+          description: Policies visible at this node, sorted by id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policies:
+                    type: array
+                    items: { $ref: "#/components/schemas/Policy" }
+                  revision: { type: integer, format: int64 }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/policies/ip-blocks:
+    post:
+      summary: Create an IP/CIDR block policy
+      description: |
+        Validates before anything enters the log (FR-015). Idempotent when
+        `request_id` is supplied: a retry replays the original outcome
+        (FR-016). Requires the bearer token when one is configured (SEC-001).
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string }
+          description: Alias of the `request_id` body field for proxy-friendly retries.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ip]
+              properties:
+                ip:
+                  type: string
+                  description: Unicast IPv4/IPv6 address, or CIDR in `target` form via engine commands.
+                  example: 203.0.113.9
+                duration:
+                  type: string
+                  description: TTL as a Go duration (e.g. "30m", "24h"); empty = permanent.
+                  example: 1h
+                reason: { type: string, example: "abuse report #1234" }
+                created_by: { type: string, example: secops }
+                request_id:
+                  type: string
+                  description: Client-chosen idempotency key (FR-016).
+      responses:
+        "201":
+          description: Committed on this cluster
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WriteResult"
+        "200":
+          description: Idempotent replay of a previous request_id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WriteResult"
+        "307":
+          description: Not the leader; resend to `Location` (FR-007)
+          headers:
+            Location:
+              schema: { type: string }
+              description: Leader's admin base URL + request URI, when known.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "400":
+          description: Validation failure — nothing entered the log
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "503":
+          description: No elected leader
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: |
+            Outcome uncertain — commit not confirmed before the deadline; the
+            write may still commit. Retry with the same `request_id`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/policies/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: { type: string }
+    get:
+      summary: Get one policy (including revoked/expired)
+      responses:
+        "200":
+          description: The policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Policy" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No such policy
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+    delete:
+      summary: Revoke a policy
+      description: |
+        Revocation is a replicated command, not a local delete; the policy
+        remains visible for audit with `status: revoked`.
+      parameters:
+        - in: query
+          name: reason
+          schema: { type: string }
+        - in: header
+          name: Idempotency-Key
+          schema: { type: string }
+      responses:
+        "200":
+          description: Revocation committed
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WriteResult" }
+        "307":
+          description: Not the leader; resend to `Location`
+          headers:
+            Location: { schema: { type: string } }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No such policy (leader's authoritative view)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "504":
+          description: Outcome uncertain — retry with the same Idempotency-Key
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/blocked/{ip}:
+    get:
+      summary: Enforcement lookup for one address
+      parameters:
+        - in: path
+          name: ip
+          required: true
+          schema: { type: string }
+          description: IPv4 or IPv6 address (not CIDR).
+      responses:
+        "200":
+          description: Lookup result at this node's applied revision
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ip, blocked, revision]
+                properties:
+                  ip: { type: string }
+                  blocked: { type: boolean }
+                  revision:
+                    type: integer
+                    format: int64
+                    description: Revision the answer is valid at (monotonic).
+                  policy_id:
+                    type: string
+                    description: The winning policy under §7.2 precedence, if blocked.
+        "400":
+          description: Path segment is not an IP address
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Admin token from `RAFTLITE_ADMIN_TOKEN`. When no token is configured
+        the API runs open and logs a warning — development only (SEC-001).
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Policy:
+      type: object
+      required: [id, type, target, action, status, created_at, version]
+      properties:
+        id: { type: string, example: pol-9f2c41d0ab773e51 }
+        type: { type: string, enum: [ip_block, cidr_block] }
+        target: { type: string, example: "203.0.113.9" }
+        action: { type: string, enum: [deny] }
+        status: { type: string, enum: [active, revoked] }
+        created_at: { type: string, format: date-time }
+        expires_at:
+          type: string
+          format: date-time
+          description: Committed absolute expiry; evaluated at lookup, never by local timers (NFR-015, ADR-0003).
+        reason: { type: string }
+        created_by: { type: string }
+        version:
+          type: integer
+          format: int64
+          description: Raft revision that last modified this policy.
+
+    WriteResult:
+      type: object
+      required: [status, policy_id, raft_index, revision]
+      properties:
+        status: { type: string, enum: [committed] }
+        policy_id: { type: string }
+        raft_index:
+          type: integer
+          format: int64
+          description: Log index of the committed command.
+        revision:
+          type: integer
+          format: int64
+          description: State-machine revision after applying the command.
+        request_id: { type: string }
+        idempotent:
+          type: boolean
+          description: Present and true on an idempotent replay (FR-016).
+
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          enum:
+            - unauthenticated
+            - invalid_json
+            - invalid_ip
+            - invalid_duration
+            - invalid_id
+            - not_found
+            - not_leader
+            - no_leader
+            - outcome_uncertain
+            - storage_error
+            - internal
+        message: { type: string }

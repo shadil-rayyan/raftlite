@@ -1,17 +1,38 @@
+// Command raftlite runs a RaftLite node: the consensus core, the gRPC peer
+// transport, and the versioned administrative API.
+//
+// Configuration (env):
+//
+//	NODE_ID              this node's identifier            (default node1)
+//	RAFT_ADDR            gRPC listen address               (default :9090)
+//	RAFTLITE_ADDR        admin HTTP listen address         (default :8080)
+//	PEERS                comma-separated voter IDs         (default node1,node2,node3)
+//	PEER_ADDRS           id=host:port pairs for the gRPC transport
+//	ADMIN_PEER_ADDRS     id=http-base-url pairs for 307 redirects
+//	WAL_PATH             write-ahead log path              (default /tmp/raftlite.wal)
+//	SNAPSHOT_DIR         snapshot directory                (default dirname(WAL_PATH)/snapshots)
+//	RAFTLITE_ADMIN_TOKEN bearer token for mutating admin calls; empty disables auth (dev only)
+//	RAFTLITE_AUDIT_LOG   audit JSON-lines path; empty disables audit
+//	RAFT_TLS_CERT / RAFT_TLS_KEY / RAFT_TLS_CA
+//	                     inter-node mTLS material; all empty = plaintext (dev only)
 package main
 
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/shadil/raftlite/internal/audit"
 	"github.com/shadil/raftlite/internal/consensus"
+	"github.com/shadil/raftlite/internal/observability"
+	"github.com/shadil/raftlite/internal/policy"
 	"github.com/shadil/raftlite/internal/server"
 	"github.com/shadil/raftlite/internal/transport"
 )
@@ -22,21 +43,63 @@ func main() {
 	nodeID := env("NODE_ID", "node1")
 	raftAddr := env("RAFT_ADDR", ":9090")
 	httpAddr := env("RAFTLITE_ADDR", ":8080")
-	peersRaw := env("PEERS", "node1,node2,node3")
-	peers := splitComma(peersRaw)
+	peers := splitComma(env("PEERS", "node1,node2,node3"))
+	walPath := env("WAL_PATH", "/tmp/raftlite.wal")
+	snapshotDir := env("SNAPSHOT_DIR", filepath.Join(filepath.Dir(walPath), "snapshots"))
+	adminToken := os.Getenv("RAFTLITE_ADMIN_TOKEN")
 
-	storage, err := transport.OpenWAL(env("WAL_PATH", "/tmp/raftlite.wal"))
+	// ---- storage: segmented WAL with durable hard state (term/vote) ----
+	storage, err := transport.OpenWAL(walPath)
 	if err != nil {
 		logger.Error("open WAL", "error", err)
 		os.Exit(1)
 	}
 	defer storage.Close()
 
+	if err := consensus.SetSnapshotDir(snapshotDir); err != nil {
+		logger.Error("snapshot dir", "dir", snapshotDir, "error", err)
+		os.Exit(1)
+	}
+
 	fsm := consensus.NewFSM()
 	node := consensus.NewNode(nodeID, peers, transport.RealClock{}, storage, fsm)
-	node.Start()
 
-	grpcSrv, lis, err := server.StartGRPCServer(raftAddr, node)
+	// ---- observability ----
+	metrics := observability.NewRegistry(nodeID)
+	node.SetMetrics(metrics)
+
+	// ---- inter-node transport: gRPC client with TLS when configured ----
+	peerAddrs := parsePeerAddrs(os.Getenv("PEER_ADDRS"))
+	tlsCfg := server.TLSConfig{
+		CAFile:   os.Getenv("RAFT_TLS_CA"),
+		CertFile: os.Getenv("RAFT_TLS_CERT"),
+		KeyFile:  os.Getenv("RAFT_TLS_KEY"),
+	}
+	if len(peerAddrs) > 0 {
+		tr, err := server.NewGRPCTransport(peerAddrs, &tlsCfg)
+		if err != nil {
+			logger.Error("peer transport", "error", err)
+			os.Exit(1)
+		}
+		defer tr.Close()
+		node.SetTransport(tr)
+	} else {
+		logger.Warn("PEER_ADDRS not set — running without peer transport (single-node/dev only)")
+	}
+
+	node.Start()
+	defer node.Stop()
+
+	// ---- gRPC server (Raft RPCs + AI loopback on one listener) ----
+	creds, err := server.LoadServerCredentials(tlsCfg)
+	if err != nil {
+		logger.Error("TLS credentials", "error", err)
+		os.Exit(1)
+	}
+	if creds == nil {
+		logger.Warn("inter-node TLS is DISABLED — plaintext Raft RPC; set RAFT_TLS_* for any shared network (SEC-003)")
+	}
+	grpcSrv, lis, err := server.StartGRPCServer(raftAddr, node, creds)
 	if err != nil {
 		logger.Error("gRPC server", "error", err)
 		os.Exit(1)
@@ -44,10 +107,33 @@ func main() {
 	defer grpcSrv.GracefulStop()
 	logger.Info("gRPC listening", "addr", lis.Addr())
 
+	// ---- audit log ----
+	auditLog, err := openAudit(logger)
+	if err != nil {
+		logger.Error("audit log", "error", err)
+		os.Exit(1)
+	}
+	defer auditLog.Close()
+
+	// ---- admin API ----
+	api := server.NewAPI(node, fsm, auditLog, adminToken, logger)
+	api.SetPeerAdminAddrs(parsePeerAddrs(os.Getenv("ADMIN_PEER_ADDRS")))
+
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", jsonHandler(map[string]string{"status": "ok"}))
-	mux.HandleFunc("GET /readyz", jsonHandler(map[string]string{"status": node.State().String()}))
-	mux.HandleFunc("GET /leader", jsonHandler(map[string]string{"leader_id": node.LeaderID()}))
+	mux.Handle("/", api.Handler())
+
+	// Real metrics from live consensus state (FR-030).
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		syncMetrics(metrics, node, fsm, storage)
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		metrics.WriteMetrics(w)
+	})
+
+	// Legacy v0.1 endpoints kept for the compose cluster and integration
+	// tests; they delegate to the same consensus path as /v1.
+	mux.HandleFunc("GET /leader", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, map[string]string{"leader_id": node.LeaderID()})
+	})
 	mux.HandleFunc("POST /block", func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
 			IP string `json:"ip"`
@@ -56,29 +142,17 @@ func main() {
 			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 			return
 		}
-		idx, err := node.Propose([]byte("add:" + body.IP))
+		cmd := legacyBlockCommand(body.IP)
+		idx, err := node.ProposeAndWait(r.Context(), cmd)
 		if err != nil {
 			http.Error(w, `{"error":"`+err.Error()+`"}`, http.StatusInternalServerError)
 			return
 		}
-		json.NewEncoder(w).Encode(map[string]any{"acked": true, "index": idx})
-	})
-	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		fmt.Fprintf(w, "# HELP raftlite_requests_total Total requests processed\n")
-		fmt.Fprintf(w, "# TYPE raftlite_requests_total counter\n")
-		fmt.Fprintf(w, "raftlite_requests_total 0\n")
-		fmt.Fprintf(w, "# HELP raftlite_elections_total Total leader elections\n")
-		fmt.Fprintf(w, "# TYPE raftlite_elections_total counter\n")
-		fmt.Fprintf(w, "raftlite_elections_total 0\n")
-		fmt.Fprintf(w, "# HELP raftlite_blocklist_size Current blocklist size\n")
-		fmt.Fprintf(w, "# TYPE raftlite_blocklist_size gauge\n")
-		fmt.Fprintf(w, "raftlite_blocklist_size 0\n")
+		writeJSON(w, map[string]any{"acked": true, "index": idx})
 	})
 	mux.HandleFunc("GET /blocked/{ip}", func(w http.ResponseWriter, r *http.Request) {
 		ip := r.PathValue("ip")
-		blocked := fsm.IsBlocked(ip)
-		json.NewEncoder(w).Encode(map[string]any{"ip": ip, "blocked": blocked})
+		writeJSON(w, map[string]any{"ip": ip, "blocked": fsm.IsBlocked(ip)})
 	})
 
 	httpServer := &http.Server{
@@ -91,7 +165,9 @@ func main() {
 	defer stop()
 
 	go func() {
-		logger.Info("raftlite starting", "http_addr", httpAddr, "raft_addr", raftAddr, "node_id", nodeID)
+		logger.Info("raftlite starting",
+			"http_addr", httpAddr, "raft_addr", raftAddr,
+			"node_id", nodeID, "peers", strings.Join(peers, ","))
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server failed", "error", err)
 			os.Exit(1)
@@ -103,7 +179,57 @@ func main() {
 	defer cancel()
 	node.Stop()
 	httpServer.Shutdown(shutdownCtx)
+	grpcSrv.GracefulStop()
 	logger.Info("raftlite stopped")
+}
+
+// syncMetrics samples consensus state into the metric registry at scrape
+// time, so gauges always reflect the current node without a background
+// sampler goroutine.
+func syncMetrics(m *observability.Registry, node *consensus.Node, fsm *consensus.FSM, st transport.Storage) {
+	m.SetLeader(node.State() == consensus.Leader)
+	m.SetTerm(node.CurrentTerm())
+	m.SetCommitIndex(node.GetCommitIndex())
+	m.SetAppliedIndex(fsm.Revision())
+	m.SetPolicies(int64(fsm.CountActive(time.Now())))
+	if w, ok := st.(*transport.WAL); ok {
+		if size, err := w.Size(); err == nil {
+			m.SetWALSizeBytes(size)
+		}
+	}
+}
+
+func openAudit(logger *slog.Logger) (*audit.Logger, error) {
+	path := audit.DefaultPath()
+	if path == "" {
+		logger.Warn("audit logging is disabled — set RAFTLITE_AUDIT_LOG (FR-031)")
+		return &audit.Logger{}, nil
+	}
+	l, err := audit.OpenFile(path)
+	if err != nil {
+		return nil, err
+	}
+	logger.Info("audit log enabled", "path", path)
+	return l, nil
+}
+
+// legacyBlockCommand builds the structured create command for the v0.1
+// POST /block endpoint so both entry points share one policy model.
+func legacyBlockCommand(ip string) []byte {
+	id, err := policy.NewID()
+	if err != nil {
+		return []byte("add:" + ip) // deterministic fallback to legacy parsing
+	}
+	cmd := policy.Command{
+		Op:        policy.OpCreate,
+		ID:        id,
+		Type:      policy.TypeIPBlock,
+		Target:    ip,
+		Reason:    "legacy /block endpoint",
+		CreatedAt: time.Now().UTC().Truncate(time.Second),
+	}
+	payload, _ := json.Marshal(cmd)
+	return payload
 }
 
 func env(key, fallback string) string {
@@ -117,21 +243,28 @@ func splitComma(s string) []string {
 	if s == "" {
 		return nil
 	}
-	var out []string
-	start := 0
-	for i := 0; i < len(s); i++ {
-		if s[i] == ',' {
-			out = append(out, s[start:i])
-			start = i + 1
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
 		}
 	}
-	out = append(out, s[start:])
 	return out
 }
 
-func jsonHandler(payload any) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(payload)
+// parsePeerAddrs parses "id=host:port,id=host:port" pairs.
+func parsePeerAddrs(s string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range splitComma(s) {
+		if idx := strings.Index(pair, "="); idx > 0 {
+			out[strings.TrimSpace(pair[:idx])] = strings.TrimSpace(pair[idx+1:])
+		}
 	}
+	return out
+}
+
+func writeJSON(w http.ResponseWriter, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(payload)
 }

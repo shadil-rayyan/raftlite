@@ -115,27 +115,63 @@ func TestLogReplication(t *testing.T) {
 	}
 }
 
-func TestJointConfig(t *testing.T) {
-	n := newNodeForTest("node1", []string{"node1", "node2", "node3"})
-	n.state = Leader
-	n.currentTerm = 1
-	n.matchIndex = map[string]uint64{"node1": 0, "node2": 0, "node3": 0}
-	n.nextIndex = map[string]uint64{"node1": 1, "node2": 1, "node3": 1}
-	for _, p := range n.peers {
-		n.nextIndex[p] = 1
-		n.matchIndex[p] = 0
+func TestMembershipAddAndRemoveVoter(t *testing.T) {
+	// Single-node leader: quorum is 1, so the first config change commits
+	// under the OLD config (correct Raft: the change is committed by the
+	// configuration that existed when it was proposed).
+	n := newNodeForTest("node1", []string{"node1"})
+	n.Start()
+	if n.State() != Leader {
+		t.Fatal("single node should be leader")
 	}
 
-	_, err := n.ProposeJointConfig([]string{"node1", "node2", "node3", "node4"})
+	// ack simulates the (nonexistent) node2 confirming replication, which
+	// real deployments get from the joining node itself.
+	ack := func(peer string) {
+		n.HandleAppendEntriesResponse(peer, n.LastLogIndex(),
+			&raftpb.AppendEntriesResponse{Term: n.CurrentTerm(), Success: true})
+	}
+
+	idx, err := n.ProposeAddVoter("node2")
 	if err != nil {
-		t.Fatalf("ProposeJointConfig: %v", err)
+		t.Fatalf("ProposeAddVoter: %v", err)
+	}
+	if idx == 0 {
+		t.Fatal("expected non-zero index")
+	}
+	peers := n.Peers()
+	if len(peers) != 2 || peers[1] != "node2" {
+		t.Fatalf("expected peers [node1 node2], got %v", peers)
 	}
 
-	if n.IsInJointConfig() {
-		t.Fatal("should not be in joint config after transition")
+	// Adding an existing member must be rejected before touching the log.
+	if _, err := n.ProposeAddVoter("node2"); err == nil {
+		t.Fatal("expected error adding duplicate voter")
 	}
-	if len(n.peers) != 4 {
-		t.Fatalf("expected 4 peers, got %d", len(n.peers))
+
+	// The config is now [node1 node2], so quorum is 2. The removal entry
+	// cannot commit until node2 acks — this is why membership changes must
+	// be driven against a live joining node in production.
+	if _, err := n.ProposeRemoveVoter("node2"); err != nil && err != ErrNoQuorum {
+		t.Fatalf("ProposeRemoveVoter: %v", err)
+	}
+	ack("node2")
+	peers = n.Peers()
+	if len(peers) != 1 || peers[0] != "node1" {
+		t.Fatalf("expected peers [node1] after removal commits, got %v", peers)
+	}
+
+	// Removing the last voter must be refused.
+	if _, err := n.ProposeRemoveVoter("node1"); err == nil {
+		t.Fatal("expected error removing last voter")
+	}
+	n.Stop()
+}
+
+func TestMembershipRequiresLeadership(t *testing.T) {
+	n := newNodeForTest("node1", []string{"node1", "node2", "node3"})
+	if _, err := n.ProposeAddVoter("node4"); err != ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
 	}
 }
 
