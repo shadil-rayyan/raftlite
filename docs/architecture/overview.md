@@ -217,26 +217,19 @@ Client IP extraction is security-sensitive. Forwarded headers must not be truste
 
 The gateway must never interpret a failed control-plane connection as permission to allow all traffic unless an explicitly configured fail-open policy requires that behavior.
 
-5.8 Rust telemetry drain
+5.8 Rust telemetry drain (temporarily removed)
 
-The telemetry drain receives and processes gateway events.
+The Rust telemetry drain is temporarily removed from this branch; see
+`docs/rust-python-sidecars.md`. The Go loopback service remains so a future
+engine can propose blocks. Telemetry ingestion must not block or bypass the
+authoritative policy-commit path.
 
-Potential responsibilities include:
+5.9 Python anomaly-detection engine (temporarily removed)
 
-Event ingestion.
-Batching and buffering.
-Input validation.
-Efficient serialization.
-Backpressure handling.
-Forwarding telemetry to the analytical pipeline.
-
-Rust is an implementation choice for efficient telemetry processing, not a requirement of the Raft protocol.
-
-Telemetry ingestion must not block or bypass the authoritative policy-commit path.
-
-5.9 Python anomaly-detection engine
-
-The anomaly-detection engine analyzes telemetry and identifies potentially suspicious behavior.
+The Python anomaly-detection engine is temporarily removed from this branch; see
+`docs/rust-python-sidecars.md`. It may analyze telemetry and propose policies
+through the Go loopback service, but must never directly modify authoritative
+state.
 
 It may use statistical rules or an Isolation Forest model to produce findings such as elevated request rates or abnormal authentication failures.
 

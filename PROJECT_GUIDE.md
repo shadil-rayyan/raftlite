@@ -12,8 +12,8 @@ RaftLite is a **self-hosted distributed control plane for security policies**
 (IP/CIDR block rules) enforced by API gateways. Multiple gateway nodes share one
 authoritative policy state replicated via a **hand-rolled Raft** state machine.
 The product is the Go consensus core + gRPC peer transport + admin HTTP API.
-Rust (telemetry drain) and Python (anomaly detector) are side pipelines,
-prototype-grade and not wired into the main binary.
+Rust/Python sidecars are temporarily removed from this branch; see
+`docs/rust-python-sidecars.md`.
 
 ---
 
@@ -23,11 +23,9 @@ prototype-grade and not wired into the main binary.
   (goroutines/channels/mutexes), first-class gRPC/protobuf support, stdlib HTTP
   router, easy cross-compile for containers. Consensus needs deterministic
   concurrency + durable I/O; Go fits.
-- **Rust (telemetry-drain)** — lock-free ring buffer + Arrow IPC batcher;
-  chosen for zero-copy, memory safety, and throughput on the hot telemetry path.
-  Sidecar only; not required for consensus.
-- **Python (ai-engine)** — Isolation Forest anomaly detection via scikit-learn;
-  ML ecosystem. Best-effort; only logs "would block", never calls Raft yet.
+- **Rust/Python sidecars** — temporarily removed; see
+  `docs/rust-python-sidecars.md`. Go loopback service retained for future
+  AI proposals.
 
 No external Raft library: `go.mod` pulls only gRPC + protobuf, by design, so
 the implementation is auditable and dependency-light.
@@ -66,8 +64,6 @@ raftlite/
 ├── api/                          # protos + generated Go + openapi.yaml
 │   ├── raft.proto, loopback.proto
 │   └── go/{raftpb,loopbackpb}/   # generated stubs
-├── telemetry-drain/              # Rust sidecar (ring buffer, Arrow batcher)
-├── ai-engine/                    # Python sidecar (Isolation Forest, stub loopback)
 ├── tests/e2e_test.go             # in-process + live-cluster e2e
 ├── scripts/                      # chaos/benchmark shell scripts
 ├── docs/                         # intended (largely aspirational) docs
@@ -109,9 +105,8 @@ raftlite/
 - **Gateway is dead code**: proxy + sync.Pool allocators not wired into
   `main.go`; blocklist middleware mounted nowhere. Gateway changes don't affect
   the binary.
-- **Telemetry write is a no-op stub** (`proxy.go::writeTelemetry`).
-- **Python gRPC loopback is a stub**: logs "would block", never calls Raft.
-- **Rust drain only listens on Unix socket**; no Go producer.
+- **Telemetry write is a no-op stub** (`proxy.go::writeTelemetry`); sidecars
+  temporarily removed (see `docs/rust-python-sidecars.md`).
 - **No joint consensus** (intentionally removed; only single-server changes).
 - Docs/README describe a larger intended system; verify against code/CI.
 
@@ -214,7 +209,7 @@ PEER_ADDRS="node1=localhost:9091,node2=localhost:9092" ...
 
 ### Cluster (docker-compose)
 
-3 nodes (HTTP 8081-8083, gRPC 9091-9093) + Rust drain + Python engine.
+3 Go nodes (HTTP 8081-8083, gRPC 9091-9093).
 `docker-compose up --build`. Chaos: `scripts/simulate_chaos.sh`. E2E needs
 `INTEGRATION=1`.
 

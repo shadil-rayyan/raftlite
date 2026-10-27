@@ -262,21 +262,6 @@ RaftLite separates policy management from request enforcement.
               v          v          v
          Local policy evaluation and enforcement
 
-    Optional analytical pipeline:
-
-    Gateway telemetry
-          |
-          v
-    Rust telemetry drain
-          |
-          v
-    Python anomaly detector
-          |
-          v
-    Policy proposal
-          |
-          v
-    RaftLite API and consensus
 ```
 
 ### 6.1 Control plane
@@ -335,23 +320,17 @@ A successful Raft commit also does not, by itself, prove that every gateway has 
 
 ### 6.4 Optional telemetry and anomaly detection
 
-Telemetry processing and anomaly detection are separate from consensus.
-
-The Rust component is intended for efficient event ingestion and buffering. The Python component is intended for feature extraction and anomaly detection.
-
-An analytical component may propose a policy change. The proposal must pass through the authoritative policy-management path before becoming committed state.
-
-This preserves the distinction between detecting suspicious behavior and deciding which policy becomes authoritative.
-
-For more detail, see the Architecture Overview.
+Telemetry processing and anomaly detection are intentionally outside the core
+consensus path. The Rust telemetry drain and Python anomaly detector are
+temporarily removed from this branch; see `docs/rust-python-sidecars.md`. The
+Go gRPC loopback service remains so a future engine can propose blocks through
+the authoritative policy path.
 
 ## 7\. Technology Stack
 
 | Component | Technology | Responsibility |
 | --- | --- | --- |
 | Control plane | Go | API, consensus integration, policy state machine, and cluster operations |
-| Telemetry drain | Rust | Efficient telemetry ingestion, buffering, and batching |
-| Anomaly detection | Python | Traffic analysis and candidate policy proposals |
 | HTTP contract | OpenAPI | Administrative API definition |
 | RPC contract | Protocol Buffers, if gRPC is adopted | Inter-service interface definition |
 | Local deployment | Docker Compose | Development and integration testing |
@@ -393,8 +372,6 @@ raftlite/
 │   ├── openapi.yaml
 │   └── proto/
 │
-├── telemetry-drain/
-├── ai-engine/
 │
 ├── configs/
 ├── deployments/
@@ -436,8 +413,6 @@ Directory responsibilities:
 | `internal/audit/` | Policy-change audit records |
 | `internal/observability/` | Metrics and structured logging |
 | `api/` | Versioned external API contracts |
-| `telemetry-drain/` | Rust telemetry ingestion service |
-| `ai-engine/` | Python analysis and anomaly detection |
 | `configs/` | Example configurations and monitoring settings |
 | `deployments/` | Deployment manifests and container definitions |
 | `tests/` | Integration, end-to-end, simulation, and failure tests |
@@ -507,8 +482,6 @@ The initial development environment is expected to require:
 - Go, matching the version specified in `go.mod`.
 - Git.
 - Docker and Docker Compose for multi-node integration testing.
-- Rust tooling if building the telemetry component.
-- Python if running the anomaly-detection component.
 
 ### Clone the repository
 

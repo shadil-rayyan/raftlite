@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/netip"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,15 @@ type NodeView interface {
 	LeaderID() string
 	Peers() []string
 	ProposeAndWait(ctx context.Context, data []byte) (uint64, error)
+}
+
+// DiagnosticsView exposes consensus internals useful for operator dashboards.
+// NodeView implementers that also provide these are reported by /v1/node and
+// /v1/diagnostics; otherwise zero values are returned.
+type DiagnosticsView interface {
+	CurrentTerm() uint64
+	LastLogIndex() uint64
+	CommitIndex() uint64
 }
 
 // API bundles handlers and dependencies.
@@ -84,6 +94,9 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", a.handleReadyz)
 	mux.HandleFunc("GET /v1/leader", a.handleLeader)
 	mux.HandleFunc("GET /v1/cluster", a.handleCluster)
+	mux.HandleFunc("GET /v1/node", a.handleNode)
+	mux.HandleFunc("GET /v1/diagnostics", a.handleDiagnostics)
+	mux.HandleFunc("GET /v1/audit", a.handleAudit)
 	mux.HandleFunc("GET /v1/policies", a.handleListPolicies)
 	mux.HandleFunc("POST /v1/policies/ip-blocks", a.handleCreateIPBlock)
 	mux.HandleFunc("GET /v1/policies/{id}", a.handleGetPolicy)
@@ -468,4 +481,152 @@ func (a *API) propose(ctx context.Context, r *http.Request, payload []byte, acto
 // can point at the leader's exact address (FR-007).
 func (a *API) SetPeerAdminAddrs(addrs map[string]string) {
 	a.peerAddrs = addrs
+}
+
+// handleNode returns this node's consensus state for dashboards and peer probes.
+func (a *API) handleNode(w http.ResponseWriter, _ *http.Request) {
+	term, lastLog, commit := uint64(0), uint64(0), uint64(0)
+	if dv, ok := a.node.(DiagnosticsView); ok {
+		term = dv.CurrentTerm()
+		lastLog = dv.LastLogIndex()
+		commit = dv.CommitIndex()
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":        a.node.ID(),
+		"role":           a.node.State().String(),
+		"leader_id":      a.node.LeaderID(),
+		"term":           term,
+		"last_log_index": lastLog,
+		"commit_index":   commit,
+		"peers":          a.node.Peers(),
+	})
+}
+
+// peerNodeState mirrors handleNode's response.
+type peerNodeState struct {
+	NodeID      string   `json:"node_id"`
+	Role        string   `json:"role"`
+	LeaderID    string   `json:"leader_id"`
+	Term        uint64   `json:"term"`
+	LastLogIndex uint64  `json:"last_log_index"`
+	CommitIndex uint64   `json:"commit_index"`
+	Peers       []string `json:"peers"`
+}
+
+type nodeDiag struct {
+	NodeID       string `json:"node_id"`
+	Role         string `json:"role"`
+	LeaderID     string `json:"leader_id"`
+	Term         uint64 `json:"term"`
+	LastLogIndex uint64 `json:"last_log_index"`
+	CommitIndex  uint64 `json:"commit_index"`
+	Reachable    bool   `json:"reachable"`
+	Error        string `json:"error,omitempty"`
+}
+
+// handleDiagnostics aggregates cluster state for operator dashboards.
+func (a *API) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
+	term, lastLog, commit := uint64(0), uint64(0), uint64(0)
+	if dv, ok := a.node.(DiagnosticsView); ok {
+		term = dv.CurrentTerm()
+		lastLog = dv.LastLogIndex()
+		commit = dv.CommitIndex()
+	}
+	self := nodeDiag{
+		NodeID:       a.node.ID(),
+		Role:         a.node.State().String(),
+		LeaderID:     a.node.LeaderID(),
+		Term:         term,
+		LastLogIndex: lastLog,
+		CommitIndex:  commit,
+		Reachable:    true,
+	}
+	peers := []nodeDiag{}
+	majorityCommit := 1
+	majorityLog := 1
+	for _, pid := range a.node.Peers() {
+		if pid == a.node.ID() {
+			continue
+		}
+		d := nodeDiag{NodeID: pid, Reachable: false}
+		base, ok := a.peerAddrs[pid]
+		if !ok {
+			peers = append(peers, d)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(base, "/")+"/v1/node", nil)
+		if err == nil {
+			if a.token != "" {
+				req.Header.Set("Authorization", "Bearer "+a.token)
+			}
+			resp, err := a.client.Do(req)
+			if err == nil && resp.StatusCode == http.StatusOK {
+				var st peerNodeState
+				if json.NewDecoder(resp.Body).Decode(&st) == nil {
+					d.Role = st.Role
+					d.LeaderID = st.LeaderID
+					d.Term = st.Term
+					d.LastLogIndex = st.LastLogIndex
+					d.CommitIndex = st.CommitIndex
+					d.Reachable = true
+				}
+				resp.Body.Close()
+			} else if err != nil {
+				d.Error = err.Error()
+			} else {
+				d.Error = resp.Status
+				resp.Body.Close()
+			}
+		} else {
+			d.Error = err.Error()
+		}
+		cancel()
+		if d.Reachable {
+			if d.CommitIndex >= commit {
+				majorityCommit++
+			}
+			if d.LastLogIndex >= commit {
+				majorityLog++
+			}
+		}
+		peers = append(peers, d)
+	}
+	total := 1
+	for _, pid := range a.node.Peers() {
+		if pid != a.node.ID() {
+			total++
+		}
+	}
+	quorum := total/2 + 1
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node":                    self,
+		"peers":                   peers,
+		"cluster_size":            total,
+		"quorum":                  quorum,
+		"majority_commit_count":   majorityCommit,
+		"majority_log_count":      majorityLog,
+		"quorum_ok":               majorityCommit >= quorum,
+		"majority_has_log":        majorityLog >= quorum,
+		"leader_id":               a.node.LeaderID(),
+		"checked_at":              time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// handleAudit returns recent audit entries.
+func (a *API) handleAudit(w http.ResponseWriter, r *http.Request) {
+	limit := 100
+	if q := r.URL.Query().Get("limit"); q != "" {
+		if n, err := strconv.Atoi(q); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	entries := []audit.Entry{}
+	if a.audit != nil {
+		entries = a.audit.Recent(limit)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries": entries,
+		"count":   len(entries),
+	})
 }

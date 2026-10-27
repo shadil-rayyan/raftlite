@@ -6,8 +6,7 @@ RaftLite: a **security-policy control plane** for API gateways (IP/CIDR block
 policies replicated via a hand-rolled Raft implementation). Polyglot:
 
 - `cmd/raftlite/` + `internal/` — Go: Raft consensus, gRPC, HTTP API (the real product)
-- `telemetry-drain/` — Rust: telemetry ingestion (side pipeline, best-effort)
-- `ai-engine/` — Python: anomaly detection (side pipeline, best-effort)
+- Rust/Python sidecars temporarily removed from this branch; see `docs/rust-python-sidecars.md`.
 
 The README and `docs/` describe **intended** behavior for a much larger system.
 Trust the code and CI workflows over the docs. Consensus, storage, and the
@@ -28,10 +27,6 @@ go test ./internal/transport/... -run TestDSTDeterminism -v   # DST harness (CI 
 go test ./internal/consensus/... -run TestDSTDeterministicElection
 go test ./internal/consensus/ -run 'TestCluster|TestMembership' -v
 
-cd telemetry-drain && cargo build && cargo test
-cd telemetry-drain && cargo clippy -- -D warnings   # CI fails on warnings
-
-python3 -m py_compile ai-engine/main.py ai-engine/models/*.py
 ```
 
 Go is **not installed** on this Windows machine; verify with `go version` before
@@ -91,15 +86,15 @@ assuming any `go` command works. Shell scripts (`scripts/*.sh`) are bash + Docke
   `api/go/{raftpb,loopbackpb}/` (protoc 5.28.2, protoc-gen-go 1.36.11).
   If you change a `.proto`, regenerate those — nothing in the repo does this
   automatically.
-- Python gRPC loopback in `ai-engine/main.py` is a **stub** (logs "would block",
-  never calls Raft). Telemetry write from Go to Rust (`proxy.go::writeTelemetry`)
-  is also a **no-op stub**. Stubs are marked with `// ponytail:` or
-  `# ponytail:` comments — grep for `ponytail` to find every known gap.
+- Telemetry write is a no-op stub (`proxy.go::writeTelemetry`); the Rust/Python
+  sidecars are temporarily removed (see `docs/rust-python-sidecars.md`). The gRPC
+  loopback service remains so a future AI engine can propose blocks. Stubs are
+  marked with `// ponytail:` comments — grep for `ponytail` to find every known
+  gap.
 
 ## docker-compose
 
-3 Go nodes (ports 8081-8083 HTTP, 9091-9093 gRPC) + Rust drain + Python engine,
-pinned to CPUs 0-4, using `/dev/shm` and `network_mode: host` for the sidecars —
+3 Go nodes (ports 8081-8083 HTTP, 9091-9093 gRPC), pinned to CPUs 0-2 —
 **Linux-only assumptions**; expect failures on Windows/macOS Docker Desktop.
 `scripts/simulate_chaos.sh` kills the leader container and polls `/leader`;
 `scripts/benchmark.sh` needs `ghz` or `wrk` installed.

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/shadil/raftlite/internal/audit"
@@ -21,20 +22,26 @@ import (
 // fakeNode implements NodeView. ProposeAndWait applies the command to the FSM
 // exactly like a real leader does, so read endpoints reflect committed writes.
 type fakeNode struct {
-	id      string
-	state   consensus.NodeState
-	leader  string
-	peers   []string
-	err     error // injected consensus failure
-	fsm     *consensus.FSM
+	id       string
+	state    consensus.NodeState
+	leader   string
+	peers    []string
+	err      error // injected consensus failure
+	fsm      *consensus.FSM
 	proposed [][]byte
-	nextIdx uint64
+	nextIdx  uint64
+	term     uint64
+	lastLog  uint64
+	commit   uint64
 }
 
-func (f *fakeNode) ID() string                { return f.id }
+func (f *fakeNode) ID() string                 { return f.id }
 func (f *fakeNode) State() consensus.NodeState { return f.state }
-func (f *fakeNode) LeaderID() string          { return f.leader }
-func (f *fakeNode) Peers() []string           { return append([]string(nil), f.peers...) }
+func (f *fakeNode) LeaderID() string           { return f.leader }
+func (f *fakeNode) Peers() []string            { return append([]string(nil), f.peers...) }
+func (f *fakeNode) CurrentTerm() uint64  { return f.term }
+func (f *fakeNode) LastLogIndex() uint64 { return f.lastLog }
+func (f *fakeNode) CommitIndex() uint64  { return f.commit }
 
 func (f *fakeNode) ProposeAndWait(_ context.Context, data []byte) (uint64, error) {
 	f.proposed = append(f.proposed, data)
@@ -406,3 +413,79 @@ func TestAuditRecordsTrueOutcome(t *testing.T) {
 // implementable by both real and mock storage (compile-time assertion).
 var _ transport.Storage = (*transport.MockStorage)(nil)
 var _ transport.Storage = (*transport.WAL)(nil)
+
+// ---- diagnostics / node / audit / ui ----
+
+func TestNodeEndpointReportsConsensusState(t *testing.T) {
+	node := &fakeNode{id: "n1", state: consensus.Leader, leader: "n1", peers: []string{"n1"}, term: 3, lastLog: 7, commit: 5}
+	api, _ := newTestAPI(t, node, "")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/node", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	m := decodeBody(t, rec)
+	if m["node_id"] != "n1" || m["role"] != "leader" || m["term"].(float64) != 3 {
+		t.Fatalf("bad node payload: %+v", m)
+	}
+	if m["last_log_index"].(float64) != 7 || m["commit_index"].(float64) != 5 {
+		t.Fatalf("bad log/commit: %+v", m)
+	}
+}
+
+func TestDiagnosticsReportsQuorum(t *testing.T) {
+	node := &fakeNode{id: "n1", state: consensus.Leader, leader: "n1", peers: []string{"n1", "n2"}, term: 2, lastLog: 4, commit: 4}
+	api, _ := newTestAPI(t, node, "")
+	api.peerAddrs = map[string]string{"n2": "http://127.0.0.1:1"} // unreachable peer
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/diagnostics", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	m := decodeBody(t, rec)
+	if m["cluster_size"].(float64) != 2 {
+		t.Fatalf("cluster size %v", m["cluster_size"])
+	}
+	if m["quorum"].(float64) != 2 {
+		t.Fatalf("quorum %v", m["quorum"])
+	}
+	// self counts, unreachable peer does not
+	if m["majority_commit_count"].(float64) != 1 {
+		t.Fatalf("majority commit %v", m["majority_commit_count"])
+	}
+	if m["quorum_ok"] != false {
+		t.Fatalf("expected quorum_ok false with one of two nodes")
+	}
+}
+
+func TestAuditEndpointReturnsEntries(t *testing.T) {
+	node := &fakeNode{id: "n1", state: consensus.Leader, leader: "n1", peers: []string{"n1"}}
+	api, _ := newTestAPI(t, node, "")
+	api.audit.Record(audit.Entry{Actor: "admin", Operation: "create", Target: "10.0.0.5", Outcome: "committed", RaftIndex: 1})
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/v1/audit?limit=10", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	m := decodeBody(t, rec)
+	if m["count"].(float64) != 1 {
+		t.Fatalf("count %v", m["count"])
+	}
+}
+
+func TestUIInjectsDevFlag(t *testing.T) {
+	t.Setenv("RAFTLITE_DEV_UI", "1")
+	node := &fakeNode{id: "n1", state: consensus.Follower, peers: []string{"n1"}}
+	api, _ := newTestAPI(t, node, "")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/ui", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "const DEV_UI = true;") {
+		t.Fatalf("dev flag not injected")
+	}
+	if !strings.Contains(rec.Body.String(), "id=\"token\"") {
+		t.Fatalf("token input missing")
+	}
+}

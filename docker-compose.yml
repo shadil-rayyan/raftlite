@@ -64,31 +64,6 @@ services:
       - wal3:/data
     cpuset: "2"
 
-  telemetry-drain:
-    build:
-      context: telemetry-drain
-      dockerfile: Dockerfile.rust
-    restart: unless-stopped
-    volumes:
-      - /dev/shm:/dev/shm
-      - /tmp:/tmp
-    network_mode: "host"
-    cpuset: "3"
-
-  ai-engine:
-    build:
-      context: ai-engine
-      dockerfile: Dockerfile.python
-    restart: unless-stopped
-    volumes:
-      - /dev/shm:/dev/shm
-    network_mode: "host"
-    cpuset: "4"
-    depends_on:
-      - node1
-      - node2
-      - node3
-
 volumes:
   wal1:
   wal2:
