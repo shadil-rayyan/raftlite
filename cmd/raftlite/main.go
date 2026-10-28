@@ -20,6 +20,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -89,6 +90,10 @@ func main() {
 
 	node.Start()
 	defer node.Stop()
+
+	if os.Getenv("RAFTLITE_DEV_UI") == "1" {
+		go seedDemoData(logger, node, fsm)
+	}
 
 	// ---- gRPC server (Raft RPCs + AI loopback on one listener) ----
 	creds, err := server.LoadServerCredentials(tlsCfg)
@@ -202,8 +207,8 @@ func syncMetrics(m *observability.Registry, node *consensus.Node, fsm *consensus
 func openAudit(logger *slog.Logger) (*audit.Logger, error) {
 	path := audit.DefaultPath()
 	if path == "" {
-		logger.Warn("audit logging is disabled — set RAFTLITE_AUDIT_LOG (FR-031)")
-		return &audit.Logger{}, nil
+		logger.Warn("audit logging is disabled — set RAFTLITE_AUDIT_LOG (FR-031); recent entries are in-memory only")
+		return audit.New(io.Discard), nil
 	}
 	l, err := audit.OpenFile(path)
 	if err != nil {
@@ -267,4 +272,68 @@ func parsePeerAddrs(s string) map[string]string {
 func writeJSON(w http.ResponseWriter, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(payload)
+}
+
+// seedDemoData populates a fresh cluster with a few demo policies so the UI
+// has something to show on first open. Dev only (RAFTLITE_DEV_UI=1); it runs
+// on whichever node wins the election and only when the FSM is empty, so
+// restarts and multi-node clusters do not duplicate data.
+func seedDemoData(logger *slog.Logger, node *consensus.Node, fsm *consensus.FSM) {
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if node.State() == consensus.Leader {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if node.State() != consensus.Leader {
+		return
+	}
+	if fsm.Revision() != 0 {
+		return // data already exists (restart or another leader seeded)
+	}
+
+	ttl := time.Now().Add(24 * time.Hour).UTC().Truncate(time.Second)
+	type seed struct {
+		target string
+		cidr   bool
+		reason string
+		exp    *time.Time
+	}
+	seeds := []seed{
+		{target: "203.0.113.10", reason: "demo: repeated auth failures"},
+		{target: "203.0.113.11", reason: "demo: scraper abuse"},
+		{target: "198.51.100.0/24", cidr: true, reason: "demo: blocked test range"},
+		{target: "192.0.2.44", reason: "demo: temporary block (24h)", exp: &ttl},
+	}
+	for _, sd := range seeds {
+		id, err := policy.NewID()
+		if err != nil {
+			logger.Warn("demo seed id", "error", err)
+			return
+		}
+		typ := policy.TypeIPBlock
+		if sd.cidr {
+			typ = policy.TypeCIDR
+		}
+		cmd := policy.Command{
+			Op:        policy.OpCreate,
+			ID:        id,
+			Type:      typ,
+			Target:    sd.target,
+			Reason:    sd.reason,
+			CreatedBy: "demo-seed",
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+			ExpiresAt: sd.exp,
+		}
+		payload, _ := json.Marshal(cmd)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err = node.ProposeAndWait(ctx, payload)
+		cancel()
+		if err != nil {
+			logger.Warn("demo seed propose", "target", sd.target, "error", err)
+			return
+		}
+	}
+	logger.Info("demo seed data created", "policies", len(seeds))
 }

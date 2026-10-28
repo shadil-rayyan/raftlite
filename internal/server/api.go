@@ -9,10 +9,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -47,12 +49,12 @@ type DiagnosticsView interface {
 
 // API bundles handlers and dependencies.
 type API struct {
-	node    NodeView
-	fsm     *consensus.FSM
-	audit   *audit.Logger
-	log     *slog.Logger
-	token     string              // admin bearer token; empty = auth disabled (dev only)
-	peerAddrs map[string]string   // peer ID -> admin base URL, for 307 redirects
+	node      NodeView
+	fsm       *consensus.FSM
+	audit     *audit.Logger
+	log       *slog.Logger
+	token     string            // admin bearer token; empty = auth disabled (dev only)
+	peerAddrs map[string]string // peer ID -> admin base URL, for 307 redirects
 	client    *http.Client
 
 	// idempotency records request_id -> outcome for safe retries (FR-016).
@@ -77,13 +79,13 @@ func NewAPI(node NodeView, fsm *consensus.FSM, auditLog *audit.Logger, token str
 		log.Warn("admin API authentication is DISABLED — set RAFTLITE_ADMIN_TOKEN for any shared environment")
 	}
 	return &API{
-		node:    node,
-		fsm:     fsm,
-		audit:   auditLog,
-		log:     log,
-		token:   token,
-		client:  &http.Client{Timeout: 5 * time.Second},
-		idem:    make(map[string]idemRecord),
+		node:   node,
+		fsm:    fsm,
+		audit:  auditLog,
+		log:    log,
+		token:  token,
+		client: &http.Client{Timeout: 5 * time.Second},
+		idem:   make(map[string]idemRecord),
 	}
 }
 
@@ -217,11 +219,11 @@ func (a *API) handleCluster(w http.ResponseWriter, _ *http.Request) {
 // ---- policy endpoints ----
 
 type createBlockRequest struct {
-	IP          string `json:"ip"`
-	Duration    string `json:"duration,omitempty"` // e.g. "1h", "30m"; empty = permanent
-	Reason      string `json:"reason,omitempty"`
-	RequestID   string `json:"request_id,omitempty"`
-	CreatedBy   string `json:"created_by,omitempty"`
+	IP        string `json:"ip"`
+	Duration  string `json:"duration,omitempty"` // e.g. "1h", "30m"; empty = permanent
+	Reason    string `json:"reason,omitempty"`
+	RequestID string `json:"request_id,omitempty"`
+	CreatedBy string `json:"created_by,omitempty"`
 }
 
 func (a *API) handleCreateIPBlock(w http.ResponseWriter, r *http.Request) {
@@ -231,8 +233,9 @@ func (a *API) handleCreateIPBlock(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	rawBody, _ := io.ReadAll(r.Body)
 	var req createBlockRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(rawBody, &req); err != nil {
 		writeErr(w, apiError{http.StatusBadRequest, "invalid_json", "request body must be valid JSON"})
 		return
 	}
@@ -294,7 +297,10 @@ func (a *API) handleCreateIPBlock(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, _ := json.Marshal(cmd)
 
-	outcome, index, aerr, loc := a.propose(r.Context(), r, payload, actor, "create_ip_block", addr.String(), req.Reason, req.RequestID)
+	outcome, index, aerr, loc := a.propose(r.Context(), w, r, rawBody, payload, actor, "create_ip_block", addr.String(), req.Reason, req.RequestID)
+	if outcome == "" {
+		return // response already written (forwarded to leader)
+	}
 	if aerr.Code != "" {
 		a.auditEvent(actor, "create_ip_block", addr.String(), req.Reason, req.RequestID, outcome, index, aerr.Message)
 		writeErrRedirect(w, aerr, loc)
@@ -343,7 +349,10 @@ func (a *API) handleRevokePolicy(w http.ResponseWriter, r *http.Request) {
 	cmd := policy.Command{Op: policy.OpRevoke, ID: id, IdemKey: reqID}
 	payload, _ := json.Marshal(cmd)
 
-	outcome, index, aerr, loc := a.propose(r.Context(), r, payload, actor, "revoke_policy", id, reason, reqID)
+	outcome, index, aerr, loc := a.propose(r.Context(), w, r, nil, payload, actor, "revoke_policy", id, reason, reqID)
+	if outcome == "" {
+		return // response already written (forwarded to leader)
+	}
 	if aerr.Code != "" {
 		a.auditEvent(actor, "revoke_policy", id, reason, reqID, outcome, index, aerr.Message)
 		writeErrRedirect(w, aerr, loc)
@@ -437,10 +446,10 @@ func policyJSON(p *policy.Policy) map[string]any {
 // propose commits a command through consensus and maps errors to API
 // outcomes. Returns a coarse outcome for audit: committed | uncertain |
 // rejected, plus a redirect location when the leader is known (307).
-func (a *API) propose(ctx context.Context, r *http.Request, payload []byte, actor, op, target, reason, reqID string) (string, uint64, apiError, string) {
+func (a *API) propose(ctx context.Context, w http.ResponseWriter, r *http.Request, rawBody, payload []byte, actor, op, target, reason, reqID string) (string, uint64, apiError, string) {
 	if a.node.State() != consensus.Leader {
-		// FR-007: never pretend the write succeeded. Point the client at
-		// the leader; the retry replays the same request (and request_id).
+		// FR-007: never pretend the write succeeded. Forward to the leader
+		// when its admin URL is known; otherwise point the client at it.
 		leader := a.node.LeaderID()
 		if leader == "" {
 			return "rejected", 0, apiError{http.StatusServiceUnavailable, "no_leader", "no elected leader; retry shortly"}, ""
@@ -448,10 +457,16 @@ func (a *API) propose(ctx context.Context, r *http.Request, payload []byte, acto
 		loc := ""
 		if base, ok := a.peerAddrs[leader]; ok && leader != a.node.ID() {
 			loc = base + r.URL.RequestURI()
+			if r.Header.Get("X-Raftlite-Forwarded") == "" && a.forwardToLeader(ctx, w, r, rawBody, base) {
+				return "", 0, apiError{}, ""
+			}
+		}
+		msg := "leader is " + leader + "; resend the request to that node"
+		if loc == "" {
+			msg += " (set ADMIN_PEER_ADDRS on this node to enable forwarding)"
 		}
 		return "rejected", 0, apiError{
-			http.StatusTemporaryRedirect, "not_leader",
-			"leader is " + leader + "; resend the request to that node",
+			http.StatusTemporaryRedirect, "not_leader", msg,
 		}, loc
 	}
 
@@ -475,6 +490,40 @@ func (a *API) propose(ctx context.Context, r *http.Request, payload []byte, acto
 	default:
 		return "rejected", 0, apiError{http.StatusInternalServerError, "storage_error", "write failed: " + err.Error()}, ""
 	}
+}
+
+// forwardToLeader proxies a mutating request to the leader's admin API and
+// copies the leader's response back verbatim. Returns false when forwarding
+// failed so the caller can fall back to a redirect. One hop only: the
+// X-Raftlite-Forwarded header prevents loops when leadership is stale.
+func (a *API) forwardToLeader(ctx context.Context, w http.ResponseWriter, r *http.Request, rawBody []byte, base string) bool {
+	url := strings.TrimRight(base, "/") + r.URL.RequestURI()
+	var body io.Reader
+	if len(rawBody) > 0 {
+		body = bytes.NewReader(rawBody)
+	}
+	req, err := http.NewRequestWithContext(ctx, r.Method, url, body)
+	if err != nil {
+		return false
+	}
+	req.Header = r.Header.Clone()
+	req.Header.Set("X-Raftlite-Forwarded", "1")
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	for k, vs := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Connection") {
+			continue
+		}
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+	return true
 }
 
 // SetPeerAdminAddrs maps peer IDs to their admin API base URLs so redirects
@@ -504,13 +553,13 @@ func (a *API) handleNode(w http.ResponseWriter, _ *http.Request) {
 
 // peerNodeState mirrors handleNode's response.
 type peerNodeState struct {
-	NodeID      string   `json:"node_id"`
-	Role        string   `json:"role"`
-	LeaderID    string   `json:"leader_id"`
-	Term        uint64   `json:"term"`
-	LastLogIndex uint64  `json:"last_log_index"`
-	CommitIndex uint64   `json:"commit_index"`
-	Peers       []string `json:"peers"`
+	NodeID       string   `json:"node_id"`
+	Role         string   `json:"role"`
+	LeaderID     string   `json:"leader_id"`
+	Term         uint64   `json:"term"`
+	LastLogIndex uint64   `json:"last_log_index"`
+	CommitIndex  uint64   `json:"commit_index"`
+	Peers        []string `json:"peers"`
 }
 
 type nodeDiag struct {
@@ -600,16 +649,16 @@ func (a *API) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	}
 	quorum := total/2 + 1
 	writeJSON(w, http.StatusOK, map[string]any{
-		"node":                    self,
-		"peers":                   peers,
-		"cluster_size":            total,
-		"quorum":                  quorum,
-		"majority_commit_count":   majorityCommit,
-		"majority_log_count":      majorityLog,
-		"quorum_ok":               majorityCommit >= quorum,
-		"majority_has_log":        majorityLog >= quorum,
-		"leader_id":               a.node.LeaderID(),
-		"checked_at":              time.Now().UTC().Format(time.RFC3339),
+		"node":                  self,
+		"peers":                 peers,
+		"cluster_size":          total,
+		"quorum":                quorum,
+		"majority_commit_count": majorityCommit,
+		"majority_log_count":    majorityLog,
+		"quorum_ok":             majorityCommit >= quorum,
+		"majority_has_log":      majorityLog >= quorum,
+		"leader_id":             a.node.LeaderID(),
+		"checked_at":            time.Now().UTC().Format(time.RFC3339),
 	})
 }
 

@@ -68,6 +68,7 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 <div class="tab" data-tab="metrics">Metrics</div>
 <div class="tab" data-tab="diag">Diagnostics</div>
 <div class="tab" id="devTab" style="display:none" data-tab="devtests">Dev Tests</div>
+<div class="tab" id="labTab" style="display:none" data-tab="testlab">Test Lab</div>
 </div>
 
 <section id="overview" class="panel active">
@@ -125,9 +126,13 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 </section>
 
 <section id="metrics" class="panel">
+<div class="grid" id="metricCards"></div>
 <div class="card">
-<h2>Prometheus Metrics</h2>
-<pre id="metricsText">loading...</pre>
+<h2>All Metrics</h2>
+<table><thead><tr><th>Metric</th><th>Value</th><th>Type</th></tr></thead>
+<tbody id="metricsTable"></tbody></table>
+<details style="margin-top:12px"><summary class="muted">Raw exposition</summary>
+<pre id="metricsText">loading...</pre></details>
 </div>
 </section>
 
@@ -149,6 +154,30 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 <h2>Dev Self-Test (removable)</h2>
 <button onclick="runTests()">Run Self-Test</button>
 <div id="testResults" style="margin-top:12px"></div>
+</div>
+</section>
+
+<section id="testlab" class="panel">
+<div class="card">
+<h2>Test Lab (removable)</h2>
+<div class="row" style="margin-bottom:12px">
+<button onclick="runLab()">Run All Scenarios</button>
+<button class="secondary" onclick="cleanupLab()">Cleanup Lab Policies</button>
+<button class="secondary" onclick="runLabScenario('liveness')">Liveness</button>
+<button class="secondary" onclick="runLabScenario('leader')">Leader / Quorum</button>
+<button class="secondary" onclick="runLabScenario('create')">Create Block</button>
+<button class="secondary" onclick="runLabScenario('idem')">Idempotency</button>
+<button class="secondary" onclick="runLabScenario('revoke')">Revoke</button>
+<button class="secondary" onclick="runLabScenario('validation')">Validation</button>
+<button class="secondary" onclick="runLabScenario('audit')">Audit</button>
+<button class="secondary" onclick="runLabScenario('metrics')">Metrics</button>
+<button class="secondary" onclick="runLabScenario('forwarding')">Follower Forwarding</button>
+</div>
+<div class="row" style="margin-bottom:12px">
+<input id="labIP" placeholder="target IP (blank = random 203.0.113.x)">
+<button class="secondary" onclick="$('labIP').value = randomTestIP()">Random IP</button>
+</div>
+<div id="labResults"></div>
 </div>
 </section>
 
@@ -223,6 +252,7 @@ async function refresh(){
     if(a.ok) renderAudit(a.data.entries || []);
     const m = await fetch('/metrics'); const mt = await m.text();
     $('metricsText').textContent = mt;
+    renderMetrics(mt);
   }catch(e){
     $('health').textContent = 'error'; $('health').className = 'badge err';
   }
@@ -264,6 +294,160 @@ function renderAudit(entries){
     tb.appendChild(tr);
   });
 }
+function renderMetrics(text){
+  const cards = [
+    ['raftlite_is_leader','Leader'],
+    ['raftlite_term','Term'],
+    ['raftlite_commit_index','Commit'],
+    ['raftlite_applied_index','Applied'],
+    ['raftlite_policies','Policies'],
+    ['raftlite_wal_size_bytes','WAL Bytes'],
+    ['raftlite_elections_total','Elections'],
+    ['raftlite_commits_total','Commits'],
+  ];
+  const values = {};
+  const rows = [];
+  text.split('\n').forEach(line=>{
+    if(!line || line.startsWith('#')) return;
+    const sp = line.lastIndexOf(' ');
+    if(sp < 0) return;
+    const lhs = line.slice(0,sp), val = line.slice(sp+1);
+    let name = lhs, labels = '';
+    const brace = lhs.indexOf('{');
+    if(brace >= 0){ name = lhs.slice(0,brace); labels = lhs.slice(brace); }
+    values[name] = val;
+    rows.push([name + labels, val]);
+  });
+  const cg = $('metricCards');
+  cg.innerHTML = '';
+  cards.forEach(function(pair){
+    const v = values[pair[0]] != null ? values[pair[0]] : '-';
+    const d = document.createElement('div');
+    d.className = 'card';
+    d.innerHTML = '<div class="label">'+pair[1]+'</div><div class="stat">'+esc(v)+'</div>';
+    cg.appendChild(d);
+  });
+  const tb = $('metricsTable'); tb.innerHTML = '';
+  rows.forEach(function(r){
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(r[0])+'</td><td>'+esc(r[1])+'</td>';
+    tb.appendChild(tr);
+  });
+}
+function randomTestIP(){
+  return '203.0.113.' + (2 + Math.floor(Math.random()*250));
+}
+let labPolicies = [];
+async function runLabScenario(name){
+  const results = [];
+  function add(step, pass, detail){ results.push({step, pass, detail}); }
+  const ip = ($('labIP').value || '').trim() || randomTestIP();
+  const reqID = 'lab-' + Date.now();
+
+  if(name === 'liveness' || name === 'all'){
+    const h = await request('/healthz');
+    add('healthz', h.ok && h.data && h.data.status==='ok', JSON.stringify(h.data));
+    const r = await request('/readyz');
+    add('readyz', r.ok, JSON.stringify(r.data));
+  }
+  if(name === 'leader' || name === 'all'){
+    const d = await request('/v1/diagnostics');
+    add('diagnostics', d.ok, d.ok ? ('quorum_ok=' + d.data.quorum_ok) : JSON.stringify(d.data));
+    if(d.ok){
+      add('quorum', !!d.data.quorum_ok, d.data.majority_commit_count + '/' + d.data.cluster_size);
+      add('majority log', !!d.data.majority_has_log, d.data.majority_log_count + '/' + d.data.cluster_size);
+      add('leader known', !!d.data.leader_id, d.data.leader_id);
+    }
+    const n = await request('/v1/node');
+    add('node identity', n.ok && !!n.data.node_id, n.ok ? (n.data.node_id + ' role=' + n.data.role) : JSON.stringify(n.data));
+  }
+  if(name === 'create' || name === 'all'){
+    const before = await request('/v1/policies');
+    const rev0 = before.ok ? before.data.revision : 0;
+    const c = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: ip, reason: 'lab test', request_id: reqID})});
+    add('create ' + ip, c.ok && c.data && c.data.status==='committed', c.status + ':' + JSON.stringify(c.data));
+    if(c.ok && c.data && c.data.policy_id){ labPolicies.push(c.data.policy_id); }
+    const b = await request('/v1/blocked/' + encodeURIComponent(ip));
+    add('blocked after create', b.ok && b.data && b.data.blocked === true, JSON.stringify(b.data));
+    const after = await request('/v1/policies');
+    add('revision advanced', after.ok && after.data.revision > rev0, (rev0) + ' -> ' + (after.ok ? after.data.revision : '?'));
+  }
+  if(name === 'idem' || name === 'all'){
+    const idemIP = randomTestIP();
+    const r1 = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: idemIP, request_id: reqID + '-idem'})});
+    const r2 = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: idemIP, request_id: reqID + '-idem'})});
+    add('first create', r1.ok && r1.data && r1.data.status==='committed', JSON.stringify(r1.data));
+    add('replay idempotent', r2.ok && r2.data && r2.data.idempotent === true, JSON.stringify(r2.data));
+    if(r1.ok && r1.data && r1.data.policy_id){ labPolicies.push(r1.data.policy_id); }
+  }
+  if(name === 'revoke' || name === 'all'){
+    const revIP = randomTestIP();
+    const c = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: revIP, request_id: reqID + '-revoke'})});
+    add('create for revoke', c.ok && c.data && c.data.status==='committed', JSON.stringify(c.data));
+    if(c.ok && c.data && c.data.policy_id){
+      const d = await request('/v1/policies/' + encodeURIComponent(c.data.policy_id), {method:'DELETE'});
+      add('revoke', d.ok, d.status + ':' + JSON.stringify(d.data));
+      const b = await request('/v1/blocked/' + encodeURIComponent(revIP));
+      add('unblocked after revoke', b.ok && b.data && b.data.blocked === false, JSON.stringify(b.data));
+    }
+  }
+  if(name === 'validation' || name === 'all'){
+    const bad = [['not-an-ip'],['256.1.1.1'],['0.0.0.0'],['::'],['10.0.0.0/8']];
+    for(const pair of bad){
+      const r = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: pair[0]})});
+      add('reject ' + pair[0], r.status === 400, r.status + ':' + JSON.stringify(r.data));
+    }
+    const badDur = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: randomTestIP(), duration: '-1h'})});
+    add('reject bad duration', badDur.status === 400, badDur.status + ':' + JSON.stringify(badDur.data));
+  }
+  if(name === 'audit' || name === 'all'){
+    const a1 = await request('/v1/audit?limit=100');
+    const count0 = a1.ok ? a1.data.count : 0;
+    await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: randomTestIP(), request_id: reqID + '-audit'})});
+    const a2 = await request('/v1/audit?limit=100');
+    add('audit grows', a2.ok && a2.data.count > count0, count0 + ' -> ' + (a2.ok ? a2.data.count : '?'));
+  }
+  if(name === 'metrics' || name === 'all'){
+    const m = await fetch('/metrics');
+    const t = await m.text();
+    add('metrics reachable', m.ok && t.includes('raftlite_commit_index'), m.status + ', ' + t.split('\n').length + ' lines');
+  }
+  if(name === 'forwarding' || name === 'all'){
+    const n = await request('/v1/node');
+    if(n.ok && n.data.role === 'follower'){
+      const f = await request('/v1/policies/ip-blocks', {method:'POST', body:JSON.stringify({ip: randomTestIP(), request_id: reqID + '-fwd'})});
+      add('follower create forwarded', f.ok, f.status + ':' + JSON.stringify(f.data));
+      if(f.ok && f.data && f.data.policy_id){ labPolicies.push(f.data.policy_id); }
+    } else {
+      add('follower forwarding', true, 'this node is the leader; forwarding not exercised');
+    }
+  }
+  renderLab(results, name);
+}
+async function runLab(){
+  const names = ['liveness','leader','create','idem','revoke','validation','audit','metrics','forwarding'];
+  for(const n of names){
+    await runLabScenario(n);
+  }
+  toast('Lab run complete');
+}
+async function cleanupLab(){
+  let ok = 0, fail = 0;
+  for(const id of labPolicies){
+    const r = await request('/v1/policies/' + encodeURIComponent(id), {method:'DELETE'});
+    if(r.ok) ok++; else fail++;
+  }
+  labPolicies = [];
+  toast('Cleanup: ' + ok + ' revoked, ' + fail + ' failed');
+}
+function renderLab(results, name){
+  const html = results.map(function(x){
+    return '<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="badge '+(x.pass?'ok':'err')+'">'+(x.pass?'PASS':'FAIL')+'</span> '+esc(x.step)+' <span class="muted">'+esc(x.detail)+'</span></div>';
+  }).join('');
+  const d = document.createElement('div');
+  d.innerHTML = '<h2 style="margin-top:12px">'+esc(name)+'</h2>' + html;
+  $('labResults').prepend(d);
+}
 async function runTests(){
   const out = [];
   function add(name, pass, detail){
@@ -288,7 +472,7 @@ async function runTests(){
   const html = out.map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="badge '+(x.pass?'ok':'err')+'">'+(x.pass?'PASS':'FAIL')+'</span> '+esc(x.name)+' <span class="muted">'+esc(x.detail)+'</span></div>').join('');
   $('testResults').innerHTML = html;
 }
-if(DEV_UI){ $('devTab').style.display = 'inline-block'; }
+if(DEV_UI){ $('devTab').style.display = 'inline-block'; $('labTab').style.display = 'inline-block'; }
 setInterval(refresh, 2000);
 refresh();
 </script>

@@ -39,9 +39,9 @@ func (f *fakeNode) ID() string                 { return f.id }
 func (f *fakeNode) State() consensus.NodeState { return f.state }
 func (f *fakeNode) LeaderID() string           { return f.leader }
 func (f *fakeNode) Peers() []string            { return append([]string(nil), f.peers...) }
-func (f *fakeNode) CurrentTerm() uint64  { return f.term }
-func (f *fakeNode) LastLogIndex() uint64 { return f.lastLog }
-func (f *fakeNode) CommitIndex() uint64  { return f.commit }
+func (f *fakeNode) CurrentTerm() uint64        { return f.term }
+func (f *fakeNode) LastLogIndex() uint64       { return f.lastLog }
+func (f *fakeNode) CommitIndex() uint64        { return f.commit }
 
 func (f *fakeNode) ProposeAndWait(_ context.Context, data []byte) (uint64, error) {
 	f.proposed = append(f.proposed, data)
@@ -487,5 +487,61 @@ func TestUIInjectsDevFlag(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "id=\"token\"") {
 		t.Fatalf("token input missing")
+	}
+}
+
+func TestFollowerForwardsCreateToLeader(t *testing.T) {
+	leaderNode := &fakeNode{id: "n1", state: consensus.Leader, leader: "n1", peers: []string{"n1", "n2"}}
+	followerNode := &fakeNode{id: "n2", state: consensus.Follower, leader: "n1", peers: []string{"n1", "n2"}}
+	leaderAPI, _ := newTestAPI(t, leaderNode, "")
+	followerAPI, _ := newTestAPI(t, followerNode, "")
+
+	leaderSrv := httptest.NewServer(leaderAPI.Handler())
+	defer leaderSrv.Close()
+	followerSrv := httptest.NewServer(followerAPI.Handler())
+	defer followerSrv.Close()
+
+	followerAPI.SetPeerAdminAddrs(map[string]string{"n1": leaderSrv.URL})
+
+	rec := postJSON(t, followerAPI.Handler(), "/v1/policies/ip-blocks", "", map[string]string{"ip": "10.0.0.9"})
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("forwarded create status %d: %s", rec.Code, rec.Body.String())
+	}
+	m := decodeBody(t, rec)
+	if m["status"] != "committed" {
+		t.Fatalf("forwarded create not committed: %+v", m)
+	}
+	if len(leaderNode.proposed) != 1 {
+		t.Fatalf("leader did not receive proposal: %d", len(leaderNode.proposed))
+	}
+}
+
+func TestFollowerWithoutPeerAddrsStillRedirects(t *testing.T) {
+	node := &fakeNode{id: "n2", state: consensus.Follower, leader: "n1", peers: []string{"n1", "n2"}}
+	api, _ := newTestAPI(t, node, "")
+	rec := postJSON(t, api.Handler(), "/v1/policies/ip-blocks", "", map[string]string{"ip": "10.0.0.9"})
+	if rec.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("status %d, want 307", rec.Code)
+	}
+	m := decodeBody(t, rec)
+	if m["error"] != "not_leader" {
+		t.Fatalf("error %v", m["error"])
+	}
+	if !strings.Contains(m["message"].(string), "ADMIN_PEER_ADDRS") {
+		t.Fatalf("missing ADMIN_PEER_ADDRS hint: %v", m["message"])
+	}
+}
+
+func TestUICountersAndLabTab(t *testing.T) {
+	t.Setenv("RAFTLITE_DEV_UI", "1")
+	node := &fakeNode{id: "n1", state: consensus.Follower, peers: []string{"n1"}}
+	api, _ := newTestAPI(t, node, "")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/ui", nil))
+	body := rec.Body.String()
+	for _, marker := range []string{"data-tab=\"testlab\"", "runLab()", "renderMetrics", "metricCards", "cleanupLab()"} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("ui missing %q", marker)
+		}
 	}
 }
