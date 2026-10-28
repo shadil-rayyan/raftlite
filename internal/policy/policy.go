@@ -40,6 +40,7 @@ const ActionDeny = "deny"
 // Policy is a single authoritative security policy (SRS §7.1).
 type Policy struct {
 	ID        string     `json:"id"`
+	Name      string     `json:"name,omitempty"`
 	Type      Type       `json:"type"`
 	Target    string     `json:"target"`
 	Action    string     `json:"action"`
@@ -70,6 +71,7 @@ func (p *Policy) Effective(now time.Time) bool {
 type Command struct {
 	Op        string     `json:"op"` // create | revoke
 	ID        string     `json:"id,omitempty"`
+	Name      string     `json:"name,omitempty"`
 	Type      Type       `json:"type,omitempty"`
 	Target    string     `json:"target,omitempty"`
 	Reason    string     `json:"reason,omitempty"`
@@ -208,6 +210,7 @@ func (e *Engine) Apply(cmd Command, revision uint64) (idem *IdemResult, err erro
 		}
 		p := &Policy{
 			ID:        cmd.ID,
+			Name:      cmd.Name,
 			Type:      typ,
 			Target:    cmd.Target,
 			Action:    ActionDeny,

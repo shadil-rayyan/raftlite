@@ -87,6 +87,15 @@ Compose is Linux-only (CPU pinning, `/dev/shm`).
 - **Metrics**: raw Prometheus text from `/metrics`.
 - **Diagnostics**: cluster size, quorum, majority commit/log counts, full JSON
   diagnostics payload, per-node reachability.
+- **Gateways (Sim)**: simulated gateway fleet — fleet cards (total / online /
+  offline / needs attention), current rollout with progress bar and
+  per-gateway results, clickable gateway table (desired vs reported revision,
+  applied/stale/rejected/offline badges, verification state), gateway detail
+  with recent events, fleet event feed. Clearly labeled SIMULATED: mock
+  acceptance does not verify real network enforcement. See
+  `docs/gateway-simulation.md`. In dev mode the panel also exposes simulator
+  controls (create/delete gateway, offline/online, set delay, reject-next /
+  accept-next / timeout-next, reset, re-reconcile).
 - **Dev Tests**: visible only with `RAFTLITE_DEV_UI=1`.
 
 ## Dev self-test

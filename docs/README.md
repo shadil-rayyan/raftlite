@@ -67,6 +67,8 @@ What happens during leader failure or quorum loss	Consistency and Failure Handli
 Which security threats must be addressed	Security Model
 How policies are represented and evaluated	Policy Model
 How the administrative API behaves	API Design
+How the dashboard UI works	UI Guide (docs/ui.md)
+How simulated gateways and rollouts work	Gateway Simulation (docs/gateway-simulation.md)
 How persistence and recovery work	Data Storage Design
 How the product is deployed	Deployment Guide
 How to operate and monitor the system	Monitoring Guide

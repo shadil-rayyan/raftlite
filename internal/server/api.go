@@ -25,6 +25,7 @@ import (
 
 	"github.com/shadil/raftlite/internal/audit"
 	"github.com/shadil/raftlite/internal/consensus"
+	"github.com/shadil/raftlite/internal/fleet"
 	"github.com/shadil/raftlite/internal/policy"
 )
 
@@ -56,6 +57,8 @@ type API struct {
 	token     string            // admin bearer token; empty = auth disabled (dev only)
 	peerAddrs map[string]string // peer ID -> admin base URL, for 307 redirects
 	client    *http.Client
+	fleet     *fleet.Manager // leader-owned gateway fleet; nil = fleet API off
+	dev       bool           // dev mode: expose /dev/mock-gateways controls
 
 	// idempotency records request_id -> outcome for safe retries (FR-016).
 	mu   sync.Mutex
@@ -104,6 +107,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/policies/{id}", a.handleGetPolicy)
 	mux.HandleFunc("DELETE /v1/policies/{id}", a.handleRevokePolicy)
 	mux.HandleFunc("GET /v1/blocked/{ip}", a.handleBlocked)
+	a.registerFleetRoutes(mux)
 	mux.HandleFunc("GET /ui", a.handleUI)
 	mux.HandleFunc("GET /", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -220,6 +224,7 @@ func (a *API) handleCluster(w http.ResponseWriter, _ *http.Request) {
 
 type createBlockRequest struct {
 	IP        string `json:"ip"`
+	Name      string `json:"name,omitempty"`
 	Duration  string `json:"duration,omitempty"` // e.g. "1h", "30m"; empty = permanent
 	Reason    string `json:"reason,omitempty"`
 	RequestID string `json:"request_id,omitempty"`
@@ -287,6 +292,7 @@ func (a *API) handleCreateIPBlock(w http.ResponseWriter, r *http.Request) {
 	cmd := policy.Command{
 		Op:        policy.OpCreate,
 		ID:        id,
+		Name:      req.Name,
 		Type:      policy.TypeIPBlock,
 		Target:    addr.String(),
 		Reason:    req.Reason,
@@ -314,6 +320,7 @@ func (a *API) handleCreateIPBlock(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 
 	a.auditEvent(actor, "create_ip_block", addr.String(), req.Reason, req.RequestID, "committed", index, "")
+	a.triggerFleetRollout(id)
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"status":     "committed",
 		"policy_id":  id,
@@ -359,6 +366,7 @@ func (a *API) handleRevokePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.auditEvent(actor, "revoke_policy", id, reason, reqID, "committed", index, "")
+	a.triggerFleetRollout(id)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "committed",
 		"policy_id":  id,
@@ -430,6 +438,9 @@ func policyJSON(p *policy.Policy) map[string]any {
 		"status":     string(p.Status),
 		"created_at": p.CreatedAt,
 		"version":    p.Version,
+	}
+	if p.Name != "" {
+		m["name"] = p.Name
 	}
 	if p.ExpiresAt != nil {
 		m["expires_at"] = p.ExpiresAt

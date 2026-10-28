@@ -32,6 +32,7 @@ import (
 
 	"github.com/shadil/raftlite/internal/audit"
 	"github.com/shadil/raftlite/internal/consensus"
+	"github.com/shadil/raftlite/internal/fleet"
 	"github.com/shadil/raftlite/internal/observability"
 	"github.com/shadil/raftlite/internal/policy"
 	"github.com/shadil/raftlite/internal/server"
@@ -123,6 +124,12 @@ func main() {
 	// ---- admin API ----
 	api := server.NewAPI(node, fsm, auditLog, adminToken, logger)
 	api.SetPeerAdminAddrs(parsePeerAddrs(os.Getenv("ADMIN_PEER_ADDRS")))
+
+	// ---- gateway fleet (leader-owned, in-memory simulation) ----
+	fleetMgr := fleet.NewManager(fleet.NewMockAdapter(), logger)
+	defer fleetMgr.Stop()
+	api.SetFleetManager(fleetMgr)
+	api.SetDevMode(os.Getenv("RAFTLITE_DEV_UI") == "1")
 
 	mux := http.NewServeMux()
 	mux.Handle("/", api.Handler())

@@ -67,6 +67,7 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 <div class="tab" data-tab="audit">Audit</div>
 <div class="tab" data-tab="metrics">Metrics</div>
 <div class="tab" data-tab="diag">Diagnostics</div>
+<div class="tab" data-tab="gateways">Gateways (Sim)</div>
 <div class="tab" id="devTab" style="display:none" data-tab="devtests">Dev Tests</div>
 <div class="tab" id="labTab" style="display:none" data-tab="testlab">Test Lab</div>
 </div>
@@ -146,6 +147,58 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 <span>Majority log <b id="majLog">-</b></span>
 </div>
 <pre id="diagJson">loading...</pre>
+</div>
+</section>
+
+<section id="gateways" class="panel">
+<div class="muted" style="margin-bottom:10px">SIMULATED gateways — acceptance is simulated by the mock adapter and does not verify real network enforcement.</div>
+<div class="grid">
+<div class="card"><div class="label">Total Gateways</div><div class="stat" id="gwTotal">-</div></div>
+<div class="card"><div class="label">Online</div><div class="stat" id="gwOnline">-</div></div>
+<div class="card"><div class="label">Offline</div><div class="stat" id="gwOffline">-</div></div>
+<div class="card"><div class="label">Needs Attention</div><div class="stat" id="gwAttention">-</div></div>
+</div>
+<div class="card">
+<h2>Current Rollout</h2>
+<div id="rolloutPanel" class="muted">no rollouts yet</div>
+</div>
+<div class="card">
+<h2>Gateways</h2>
+<table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Desired</th><th>Reported</th><th>State</th><th>Verification</th><th>Last Error</th></tr></thead>
+<tbody id="gatewaysBody"></tbody></table>
+</div>
+<div class="card" id="gwDetailCard" style="display:none">
+<h2 id="gwDetailTitle">Gateway Detail</h2>
+<pre id="gwDetail">-</pre>
+<h2>Recent Events</h2>
+<table><thead><tr><th>Time</th><th>Type</th><th>Result</th><th>Revision</th><th>Error</th></tr></thead>
+<tbody id="gwDetailEvents"></tbody></table>
+</div>
+<div class="card" id="gwDevCard" style="display:none">
+<h2>Simulator Controls (dev only)</h2>
+<div class="row" style="margin-bottom:8px">
+<input id="gwName" placeholder="gateway name" style="width:150px">
+<input id="gwDelay" placeholder="delay ms" style="width:90px">
+<button onclick="gwCreate()">Create Gateway</button>
+<button class="secondary" onclick="gwReconcile()">Re-reconcile</button>
+</div>
+<div class="row" style="margin-bottom:8px">
+<input id="gwTarget" placeholder="gateway id (gw-001)" style="width:150px">
+<button class="secondary" onclick="gwScenario('offline')">Offline</button>
+<button class="secondary" onclick="gwScenario('online')">Online</button>
+<button class="secondary" onclick="gwScenario('reject-next')">Reject Next</button>
+<button class="secondary" onclick="gwScenario('accept-next')">Accept Next</button>
+<button class="secondary" onclick="gwScenario('timeout-next')">Timeout Next</button>
+<button class="secondary" onclick="gwScenario('reset')">Reset</button>
+<button class="secondary" onclick="gwSetDelay()">Set Delay</button>
+<button class="secondary" onclick="gwDelete()">Delete</button>
+</div>
+<div class="muted">One-shot flags apply to the next delivery only. Timeout means no response within the delivery window — it is not a rejection.</div>
+</div>
+<div class="card">
+<h2>Recent Fleet Events</h2>
+<table><thead><tr><th>Time</th><th>Gateway</th><th>Type</th><th>Result</th><th>Revision</th><th>Error</th></tr></thead>
+<tbody id="gwEventsBody"></tbody></table>
 </div>
 </section>
 
@@ -253,6 +306,7 @@ async function refresh(){
     const m = await fetch('/metrics'); const mt = await m.text();
     $('metricsText').textContent = mt;
     renderMetrics(mt);
+    refreshFleet();
   }catch(e){
     $('health').textContent = 'error'; $('health').className = 'badge err';
   }
@@ -472,7 +526,117 @@ async function runTests(){
   const html = out.map(x=>'<div style="padding:6px 0;border-bottom:1px solid var(--line)"><span class="badge '+(x.pass?'ok':'err')+'">'+(x.pass?'PASS':'FAIL')+'</span> '+esc(x.name)+' <span class="muted">'+esc(x.detail)+'</span></div>').join('');
   $('testResults').innerHTML = html;
 }
-if(DEV_UI){ $('devTab').style.display = 'inline-block'; $('labTab').style.display = 'inline-block'; }
+let fleetGws = [];
+function gwState(g){
+  if(g.connection_status === 'offline') return 'offline';
+  if(g.last_rejected_revision != null && g.last_rejected_revision === g.desired_revision) return 'rejected';
+  if(g.desired_revision > 0 && g.desired_revision === g.reported_accepted_revision) return 'applied';
+  if(g.desired_revision > g.reported_accepted_revision) return 'stale';
+  return 'unknown';
+}
+function gwStateBadge(s){
+  const cls = {applied:'ok', offline:'err', rejected:'err'}[s] || '';
+  return '<span class="badge '+cls+'">'+esc(s)+'</span>';
+}
+async function refreshFleet(){
+  const g = await request('/v1/fleet/gateways');
+  if(!g.ok){ $('gwTotal').textContent = '-'; return; }
+  fleetGws = g.data.gateways || [];
+  const s = g.data.summary || {};
+  $('gwTotal').textContent = s.total != null ? s.total : '-';
+  $('gwOnline').textContent = s.online != null ? s.online : '-';
+  $('gwOffline').textContent = s.offline != null ? s.offline : '-';
+  $('gwAttention').textContent = s.needs_attention != null ? s.needs_attention : '-';
+  const tb = $('gatewaysBody'); tb.innerHTML = '';
+  fleetGws.forEach(x=>{
+    const tr = document.createElement('tr');
+    tr.style.cursor = 'pointer';
+    tr.onclick = function(){ gwDetail(x.id); };
+    tr.innerHTML = '<td>'+esc(x.id)+'</td><td>'+esc(x.name)+'</td><td>'+gwStateBadge(x.connection_status)+
+      '</td><td>'+esc(x.desired_revision)+'</td><td>'+esc(x.reported_accepted_revision)+'</td><td>'+
+      gwStateBadge(gwState(x))+'</td><td>'+esc(x.verification)+'</td><td>'+esc(x.last_error ? x.last_error.code : '')+'</td>';
+    tb.appendChild(tr);
+  });
+  const r = await request('/v1/fleet/rollouts');
+  if(r.ok) renderRollout((r.data.rollouts || [])[0]);
+  const e = await request('/v1/fleet/events?limit=50');
+  renderFleetEvents(e.ok ? (e.data.events || []) : []);
+}
+function renderRollout(ro){
+  const el = $('rolloutPanel');
+  if(!ro){ el.textContent = 'no rollouts yet'; return; }
+  let done = 0, total = 0;
+  const rows = [];
+  Object.keys(ro.results || {}).sort().forEach(function(k){
+    const res = ro.results[k]; total++;
+    if(res.status === 'accepted' || res.status === 'rejected' || res.status === 'timeout' || res.status === 'offline' || res.status === 'superseded') done++;
+    rows.push('<tr><td>'+esc(k)+'</td><td>'+gwStateBadge(res.status)+'</td><td>'+esc(res.revision)+'</td><td>'+esc(res.error ? res.error.code : '')+'</td></tr>');
+  });
+  const pct = total ? Math.round(done*100/total) : 0;
+  el.innerHTML = '<div style="margin-bottom:6px"><b>'+esc(ro.id)+'</b> revision '+esc(ro.revision)+
+    ' <span class="muted">('+esc(ro.trigger_type)+')</span> — '+done+'/'+total+' resolved</div>'+
+    '<div style="background:var(--line);border-radius:4px;height:8px;margin-bottom:8px"><div style="background:var(--blue);border-radius:4px;height:8px;width:'+pct+'%"></div></div>'+
+    '<table><tbody>'+rows.join('')+'</tbody></table>';
+}
+function renderFleetEvents(evs){
+  const tb = $('gwEventsBody'); tb.innerHTML = '';
+  evs.forEach(function(e){
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(new Date(e.timestamp).toLocaleTimeString())+'</td><td>'+esc(e.gateway_id)+'</td><td>'+
+      esc(e.type)+'</td><td>'+esc(e.result)+'</td><td>'+esc(e.revision)+'</td><td>'+esc(e.error ? e.error.code+' '+e.error.message : '')+'</td>';
+    tb.appendChild(tr);
+  });
+}
+async function gwDetail(id){
+  const r = await request('/v1/fleet/gateways/'+encodeURIComponent(id));
+  if(!r.ok){ toast('gateway detail failed: '+r.status); return; }
+  $('gwDetailCard').style.display = 'block';
+  $('gwDetailTitle').textContent = 'Gateway Detail — ' + id + ' (SIMULATED)';
+  $('gwDetail').textContent = JSON.stringify(r.data.gateway, null, 2);
+  const tb = $('gwDetailEvents'); tb.innerHTML = '';
+  (r.data.events || []).forEach(function(e){
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(new Date(e.timestamp).toLocaleTimeString())+'</td><td>'+esc(e.type)+'</td><td>'+
+      esc(e.result)+'</td><td>'+esc(e.revision)+'</td><td>'+esc(e.error ? e.error.code : '')+'</td>';
+    tb.appendChild(tr);
+  });
+}
+async function gwCreate(){
+  const body = {name: $('gwName').value.trim() || 'sim-gateway'};
+  if($('gwDelay').value) body.delay_ms = parseInt($('gwDelay').value, 10);
+  const r = await request('/v1/fleet/gateways', {method:'POST', body: JSON.stringify(body)});
+  toast(r.ok ? 'gateway created' : 'create failed: '+r.status);
+  refreshFleet();
+}
+async function gwReconcile(){
+  const r = await request('/v1/fleet/reconcile', {method:'POST'});
+  toast(r.ok ? 'reconcile scheduled' : 'reconcile: '+(r.data && r.data.message ? r.data.message : r.status));
+  refreshFleet();
+}
+function gwTargetId(){ return $('gwTarget').value.trim(); }
+async function gwScenario(action){
+  const id = gwTargetId();
+  if(!id){ toast('enter a gateway id'); return; }
+  const r = await request('/dev/mock-gateways/'+encodeURIComponent(id)+'/scenarios/'+action, {method:'POST'});
+  toast(r.ok ? action+' applied to '+id : action+' failed: '+r.status);
+  refreshFleet();
+}
+async function gwSetDelay(){
+  const id = gwTargetId();
+  if(!id){ toast('enter a gateway id'); return; }
+  const ms = parseInt($('gwDelay').value, 10);
+  if(isNaN(ms)){ toast('enter delay ms'); return; }
+  const r = await request('/dev/mock-gateways/'+encodeURIComponent(id)+'/scenarios/set-delay', {method:'POST', body: JSON.stringify({delay_ms: ms})});
+  toast(r.ok ? 'delay set' : 'set-delay failed: '+r.status);
+}
+async function gwDelete(){
+  const id = gwTargetId();
+  if(!id){ toast('enter a gateway id'); return; }
+  const r = await request('/dev/mock-gateways/'+encodeURIComponent(id), {method:'DELETE'});
+  toast(r.ok ? 'gateway deleted' : 'delete failed: '+r.status);
+  refreshFleet();
+}
+if(DEV_UI){ $('devTab').style.display = 'inline-block'; $('labTab').style.display = 'inline-block'; $('gwDevCard').style.display = 'block'; }
 setInterval(refresh, 2000);
 refresh();
 </script>
