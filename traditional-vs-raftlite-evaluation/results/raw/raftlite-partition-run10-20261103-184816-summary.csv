@@ -1,0 +1,2 @@
+run_id,after_heal_failed,after_heal_succeeded,baseline_failed,baseline_succeeded,data_path_ok_during_cut,healed_node_catchup_ms,isolated_component,isolated_write_success_pct,isolation_ms,majority_available,policies_complete,while_isolated_attempted,while_isolated_failed,while_isolated_succeeded
+10,0,34,0,33,true,410.98,node3,100,1674.43,true,100,33,0,33

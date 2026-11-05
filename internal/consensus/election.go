@@ -22,13 +22,15 @@ func (n *Node) startElection() {
 	n.votedFor = n.id
 	n.leaderID = ""
 	term := n.currentTerm
+	n.recordEvent(term, EvElectionStarted, "campaigning")
 	lastIdx := n.log[len(n.log)-1].Index
 	lastTerm := n.log[len(n.log)-1].Term
 	peers := append([]string(nil), n.peers...)
 	tr := n.transport
 
 	// §5.4.2: persist term + self-vote BEFORE sending any request. A crash
-	// here must not allow a second vote in this term.
+	// here must not allow a second vote in this term. persistHardStateLocked
+	// records the failure (event + metric) on its way out.
 	if err := n.persistHardStateLocked(); err != nil {
 		// Cannot campaign safely without durable vote; step back and retry
 		// on the next timeout.
@@ -110,6 +112,7 @@ func (n *Node) winElection(term uint64) {
 	}
 	n.state = Leader
 	n.leaderID = n.id
+	n.recordEvent(n.currentTerm, EvLeaderElected, "won election; term started")
 	last := n.log[len(n.log)-1].Index
 	for _, p := range n.peers {
 		if p == n.id {
@@ -135,11 +138,13 @@ func (n *Node) winElection(term uint64) {
 	}); err != nil {
 		// Could not persist the no-op: roll back and stay candidate; the
 		// next election timeout retries. Never lead with an unpersisted log.
+		n.noteStorageFailureLocked("append_noop", err)
 		n.log = n.log[:len(n.log)-1]
 		n.state = Candidate
 		n.mu.Unlock()
 		return
 	}
+	n.noteStorageSuccessLocked()
 	n.matchIndex[n.id] = noop.Index
 	n.nextIndex[n.id] = noop.Index + 1
 	// Single-voter quorum commits the no-op (and any prior-term prefix)
@@ -169,9 +174,11 @@ func (n *Node) handleVoteResponse(resp *raftpb.RequestVoteResponse) {
 		n.currentTerm = resp.Term
 		n.state = Follower
 		n.votedFor = ""
+		n.recordEvent(resp.Term, EvTermBumped, "higher term seen in vote response; stepped down")
 		_ = n.persistHardStateLocked()
 		n.resetElectionTimer()
 		n.reportStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 	}
 }
 
@@ -193,9 +200,11 @@ func (n *Node) HandleVoteRequest(req *raftpb.RequestVoteRequest) *raftpb.Request
 		n.currentTerm = req.Term
 		n.state = Follower
 		n.votedFor = ""
+		n.recordEvent(req.Term, EvTermBumped, "higher term seen in vote request; stepped down")
 		// Raft §5.1: a term bump is persisted even when no vote is granted,
 		// so this node can never act on the older term after a restart.
 		_ = n.persistHardStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 	}
 
 	candidate := string(req.CandidateId)
@@ -216,6 +225,7 @@ func (n *Node) HandleVoteRequest(req *raftpb.RequestVoteRequest) *raftpb.Request
 			}
 			resp.VoteGranted = true
 			resp.Term = n.currentTerm
+			n.recordEvent(n.currentTerm, EvVoteGranted, "granted to "+candidate)
 			n.resetElectionTimer()
 		}
 	}

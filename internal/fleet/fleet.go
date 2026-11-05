@@ -23,59 +23,64 @@ import (
 
 // Gateway lifecycle and rollout states.
 const (
-	StatusOnline   = "online"
-	StatusOffline  = "offline"
-	StatusReconn   = "reconnecting"
-	AdapterMock    = "mock"
-	AdapterEnvoy   = "envoy" // reserved for the future real adapter
-	VerifUntested  = "not_tested"
-	VerifVerified  = "verified"
-	VerifFailed    = "failed"
-	VerifUnknown   = "unknown"
-	RollPending    = "pending"
-	RollQueued     = "queued"
-	RollSending    = "sending"
-	RollAccepted   = "accepted"
-	RollRejected   = "rejected"
-	RollTimeout    = "timeout"
-	RollOffline    = "offline"
-	RollSuperseded = "superseded"
+	StatusOnline  = "online"
+	StatusOffline = "offline"
+	StatusReconn  = "reconnecting"
+	AdapterMock   = "mock"
+	AdapterEnvoy  = "envoy" // reserved for the future real adapter
+	// AdapterEnvoySim is a standalone simulated-Envoy process (cmd/simgw):
+	// a real reverse proxy that enforces the snapshot it applies and pulls
+	// configuration from this control plane instead of being faked in-process.
+	AdapterEnvoySim = "envoy-sim"
+	VerifUntested   = "not_tested"
+	VerifVerified   = "verified"
+	VerifFailed     = "failed"
+	VerifUnknown    = "unknown"
+	RollPending     = "pending"
+	RollQueued      = "queued"
+	RollSending     = "sending"
+	RollAccepted    = "accepted"
+	RollRejected    = "rejected"
+	RollTimeout     = "timeout"
+	RollOffline     = "offline"
+	RollSuperseded  = "superseded"
 )
 
 // Event types.
 const (
-	EvGatewayCreated   = "gateway_created"
-	EvGatewayOffline   = "gateway_offline"
-	EvGatewayReconn    = "gateway_reconnected"
-	EvPolicyPublished  = "policy_published"
-	EvRolloutCreated   = "rollout_created"
+	EvGatewayCreated    = "gateway_created"
+	EvGatewayOffline    = "gateway_offline"
+	EvGatewayReconn     = "gateway_reconnected"
+	EvPolicyPublished   = "policy_published"
+	EvRolloutCreated    = "rollout_created"
 	EvDeliveryScheduled = "delivery_scheduled"
-	EvConfigAccepted   = "config_accepted"
-	EvConfigRejected   = "config_rejected"
-	EvDeliveryTimeout  = "delivery_timed_out"
-	EvReconciled       = "gateway_reconciled"
-	EvSuperseded       = "rollout_superseded"
-	EvVerification     = "verification"
+	EvConfigAccepted    = "config_accepted"
+	EvConfigRejected    = "config_rejected"
+	EvDeliveryTimeout   = "delivery_timed_out"
+	EvReconciled        = "gateway_reconciled"
+	EvSuperseded        = "rollout_superseded"
+	EvVerification      = "verification"
 )
 
 // Gateway is a fleet member with a stable identity. Desired and reported
 // state are separate fields by design; never collapse them into one
 // "current" value.
 type Gateway struct {
-	ID                       string    `json:"id"`
-	Name                     string    `json:"name"`
-	Description              string    `json:"description,omitempty"`
-	AdapterType              string    `json:"adapter_type"`
-	ConnectionStatus         string    `json:"connection_status"`
-	DesiredRevision          uint64    `json:"desired_revision"`
-	ReportedAcceptedRevision uint64    `json:"reported_accepted_revision"`
-	LastRejectedRevision     *uint64   `json:"last_rejected_revision,omitempty"`
-	LastHeartbeatAt          time.Time `json:"last_heartbeat_at"`
-	LastUpdateAt             time.Time `json:"last_update_at"`
+	ID                       string      `json:"id"`
+	Name                     string      `json:"name"`
+	Description              string      `json:"description,omitempty"`
+	AdapterType              string      `json:"adapter_type"`
+	ProxyURL                 string      `json:"proxy_url,omitempty"` // data-path base URL; envoy-sim gateways only
+	ConnectionStatus         string      `json:"connection_status"`
+	DesiredRevision          uint64      `json:"desired_revision"`
+	ReportedAcceptedRevision uint64      `json:"reported_accepted_revision"`
+	LastRejectedRevision     *uint64     `json:"last_rejected_revision,omitempty"`
+	LastHeartbeatAt          time.Time   `json:"last_heartbeat_at"`
+	LastUpdateAt             time.Time   `json:"last_update_at"`
 	LastError                *EventError `json:"last_error,omitempty"`
-	Verification             string    `json:"verification"`
-	CreatedAt                time.Time `json:"created_at"`
-	UpdatedAt                time.Time `json:"updated_at"`
+	Verification             string      `json:"verification"`
+	CreatedAt                time.Time   `json:"created_at"`
+	UpdatedAt                time.Time   `json:"updated_at"`
 }
 
 // EventError carries structured adapter error details.
@@ -139,10 +144,10 @@ type PolicyView struct {
 
 // eventLog is a bounded FIFO of events preserving history.
 type eventLog struct {
-	mu   sync.Mutex
-	max  int
-	seq  uint64
-	all  []Event
+	mu  sync.Mutex
+	max int
+	seq uint64
+	all []Event
 }
 
 func newEventLog(max int) *eventLog { return &eventLog{max: max} }

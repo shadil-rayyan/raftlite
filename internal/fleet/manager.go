@@ -26,8 +26,15 @@ type Manager struct {
 	lastSnap *ConfigSnapshot
 	timeout  time.Duration
 	timers   map[string]*time.Timer // gatewayID -> in-flight delivery timer
-	stopped  bool
-	stopCh   chan struct{}
+	// verif holds per-policy enforcement-probe outcomes, keyed
+	// gatewayID -> policyID. The ONLY producer is the probe path
+	// (MarkVerification); acceptance reports never touch it.
+	verif map[string]map[string]PolicyVerification
+	// heartbeatTimeout is how long a pull-based (envoy-sim) gateway may go
+	// without a poll/report before it is classified offline.
+	heartbeatTimeout time.Duration
+	stopped          bool
+	stopCh           chan struct{}
 }
 
 // Errors returned by Manager operations.
@@ -47,14 +54,16 @@ func NewManager(adapter Adapter, log *slog.Logger) *Manager {
 		log = slog.Default()
 	}
 	m := &Manager{
-		log:      log,
-		gateways: make(map[string]*Gateway),
-		rollouts: make(map[string]*Rollout),
-		events:   newEventLog(1000),
-		adapter:  adapter,
-		timeout:  5 * time.Second,
-		timers:   make(map[string]*time.Timer),
-		stopCh:   make(chan struct{}),
+		log:              log,
+		gateways:         make(map[string]*Gateway),
+		rollouts:         make(map[string]*Rollout),
+		events:           newEventLog(1000),
+		adapter:          adapter,
+		timeout:          5 * time.Second,
+		timers:           make(map[string]*time.Timer),
+		verif:            make(map[string]map[string]PolicyVerification),
+		heartbeatTimeout: 15 * time.Second,
+		stopCh:           make(chan struct{}),
 	}
 	go m.consumeResults()
 	go m.heartbeatLoop()
@@ -121,7 +130,7 @@ func (m *Manager) DeleteGateway(id string) error {
 	if !ok {
 		return ErrNotFound
 	}
-	if gw.AdapterType != AdapterMock {
+	if gw.AdapterType != AdapterMock && gw.AdapterType != AdapterEnvoySim {
 		return ErrNotSimulated
 	}
 	if len(m.order) > 0 {
@@ -135,6 +144,7 @@ func (m *Manager) DeleteGateway(id string) error {
 		delete(m.timers, id)
 	}
 	delete(m.gateways, id)
+	delete(m.verif, id)
 	m.events.add(Event{Timestamp: time.Now().UTC(), GatewayID: id, Type: "gateway_deleted"})
 	return nil
 }
@@ -154,9 +164,20 @@ func (m *Manager) Get(id string) (Gateway, bool) {
 func (m *Manager) List() []Gateway {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]Gateway, 0, len(m.gateways))
+	inner := m.sortedGatewaysLocked()
+	out := make([]Gateway, len(inner))
+	for i, gw := range inner {
+		out[i] = *gw
+	}
+	return out
+}
+
+// sortedGatewaysLocked returns gateway pointers sorted by ID. Caller holds
+// m.mu.
+func (m *Manager) sortedGatewaysLocked() []*Gateway {
+	out := make([]*Gateway, 0, len(m.gateways))
 	for _, gw := range m.gateways {
-		out = append(out, *gw)
+		out = append(out, gw)
 	}
 	for i := 1; i < len(out); i++ {
 		for j := i; j > 0 && out[j].ID < out[j-1].ID; j-- {

@@ -18,6 +18,10 @@ func (n *Node) broadcastAppendEntriesLocked() {
 	term := n.currentTerm
 	leaderID := n.id
 	commit := n.commitIndex
+	// ReadIndex correlation: every send goroutine below reports the
+	// generation current at spawn so post-capture acks can be told apart
+	// from stale in-flight ones (see readindex.go).
+	gen := n.readGen
 	type job struct {
 		peer string
 		req  *raftpb.AppendEntriesRequest
@@ -45,15 +49,15 @@ func (n *Node) broadcastAppendEntriesLocked() {
 				Data:              data,
 			}
 			tr := n.transport
-			go func(peer string, req *raftpb.InstallSnapshotRequest) {
+			go func(peer string, req *raftpb.InstallSnapshotRequest, gen uint64) {
 				ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 				defer cancel()
 				resp, err := tr.SendInstallSnapshot(ctx, peer, req)
 				if err != nil || resp == nil {
 					return
 				}
-				n.handleInstallSnapshotResponse(peer, req.LastIncludedIndex, resp)
-			}(peer, req)
+				n.handleInstallSnapshotResponse(peer, req.LastIncludedIndex, resp, gen)
+			}(peer, req, gen)
 			continue
 		}
 
@@ -94,7 +98,7 @@ func (n *Node) broadcastAppendEntriesLocked() {
 	tr := n.transport
 	go func() {
 		for _, j := range jobs {
-			go func(peer string, req *raftpb.AppendEntriesRequest) {
+			go func(peer string, req *raftpb.AppendEntriesRequest, gen uint64) {
 				ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
 				defer cancel()
 				resp, err := tr.SendAppendEntries(ctx, peer, req)
@@ -102,8 +106,8 @@ func (n *Node) broadcastAppendEntriesLocked() {
 					return
 				}
 				sentUpTo := req.PrevLogIndex + uint64(len(req.Entries))
-				n.HandleAppendEntriesResponse(peer, sentUpTo, resp)
-			}(j.peer, j.req)
+				n.handleAppendEntriesResponse(peer, sentUpTo, resp, gen)
+			}(j.peer, j.req, gen)
 		}
 	}()
 }
@@ -191,11 +195,16 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 		n.currentTerm = req.Term
 		n.state = Follower
 		n.votedFor = ""
+		n.recordEvent(req.Term, EvTermBumped, "higher term seen in append entries; stepped down")
 		_ = n.persistHardStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 	}
 
 	// Valid leader contact: learn leadership and reset the election timer.
-	n.leaderID = string(req.LeaderId)
+	if leader := string(req.LeaderId); leader != "" && leader != n.leaderID {
+		n.leaderID = leader
+		n.recordEvent(req.Term, EvLeaderObserved, "leader is "+leader)
+	}
 	if n.state == Candidate {
 		n.state = Follower
 	}
@@ -239,6 +248,14 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 	}
 
 	// Append entries, truncating any conflicting uncommitted suffix.
+	// Durability discipline: perform the storage operation FIRST and mutate
+	// the in-memory log only after it succeeds, so disk and memory stay in
+	// lockstep. On any storage error this node responds Success=false
+	// WITHOUT advancing commitIndex or applying — never acknowledge an
+	// entry that is not durable. ConflictIndex is left unset to mark the
+	// failure as transient (not a log mismatch); the leader waits for its
+	// next heartbeat instead of hot-looping, and retries from the same
+	// position because disk and memory still agree.
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + 1 + uint64(i)
 		existing, exists := n.logAt(idx)
@@ -246,21 +263,30 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 			if existing.Term == entry.Term {
 				continue // already have it
 			}
-			// Conflict: truncate local suffix, then append.
+			// Conflict: drop the durable suffix first, then memory.
+			if err := n.storage.Truncate(idx - 1); err != nil {
+				n.noteStorageFailureLocked("truncate", err)
+				resp.Success = false
+				return resp
+			}
 			base := n.log[0].Index
 			n.log = n.log[:idx-base]
-			_ = n.storage.Truncate(idx - 1)
 			// fall through to append below
+		}
+		if err := n.storage.Append(transport.LogEntry{
+			Index: entry.Index, Term: entry.Term,
+			Type: byte(entry.Type), Data: entry.Data,
+		}); err != nil {
+			n.noteStorageFailureLocked("append", err)
+			resp.Success = false
+			return resp
 		}
 		n.log = append(n.log, LogEntry{
 			Index: entry.Index, Term: entry.Term,
 			Type: entry.Type, Data: entry.Data,
 		})
-		_ = n.storage.Append(transport.LogEntry{
-			Index: entry.Index, Term: entry.Term,
-			Type: byte(entry.Type), Data: entry.Data,
-		})
 	}
+	n.noteStorageSuccessLocked()
 
 	if req.LeaderCommit > n.commitIndex {
 		lastNew := req.PrevLogIndex + uint64(len(req.Entries))
@@ -282,7 +308,15 @@ func (n *Node) HandleAppendEntries(req *raftpb.AppendEntriesRequest) *raftpb.App
 // `sentUpTo` is the last index the leader shipped in the request — using it
 // (instead of the leader's own last index) keeps matchIndex accurate when
 // multiple appends are in flight.
+//
+// The exported form is for tests and manual injection; traffic from the
+// send goroutines goes through the private form, which carries the
+// ReadIndex generation of the request that produced the response.
 func (n *Node) HandleAppendEntriesResponse(peer string, sentUpTo uint64, resp *raftpb.AppendEntriesResponse) {
+	n.handleAppendEntriesResponse(peer, sentUpTo, resp, 0)
+}
+
+func (n *Node) handleAppendEntriesResponse(peer string, sentUpTo uint64, resp *raftpb.AppendEntriesResponse, readGen uint64) {
 	n.mu.Lock()
 	advanced := false
 	defer func() {
@@ -294,6 +328,7 @@ func (n *Node) HandleAppendEntriesResponse(peer string, sentUpTo uint64, resp *r
 	}()
 
 	if n.state != Leader {
+		n.failPendingReadsLocked(ErrNotLeader)
 		return
 	}
 
@@ -304,8 +339,14 @@ func (n *Node) HandleAppendEntriesResponse(peer string, sentUpTo uint64, resp *r
 		_ = n.persistHardStateLocked()
 		n.resetElectionTimer()
 		n.reportStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 		return
 	}
+
+	// Count toward any in-flight ReadIndex round before branching on
+	// success: a response at our term proves the peer received the
+	// post-capture request whether it matched the log or not.
+	n.noteReadAckLocked(readGen, peer, resp.Term)
 
 	if resp.Success {
 		if sentUpTo > n.matchIndex[peer] {
@@ -316,6 +357,17 @@ func (n *Node) HandleAppendEntriesResponse(peer string, sentUpTo uint64, resp *r
 		n.updateCommitIndexLocked()
 		n.persistCommitLocked()
 		advanced = n.commitIndex > before
+		return
+	}
+
+	// Failure with NO conflict hints is a transient reject: a stale-term
+	// response, or (deliberately) a follower whose storage just failed —
+	// HandleAppendEntries leaves ConflictIndex unset in that case so this
+	// side can tell the difference. Do NOT rewind nextIndex (the follower
+	// has not reported a log mismatch) and do NOT retry immediately: the
+	// next heartbeat retries within one heartbeat interval instead of
+	// hot-looping against a dead disk.
+	if resp.ConflictTerm == 0 && resp.ConflictIndex == 0 {
 		return
 	}
 
@@ -341,10 +393,11 @@ func (n *Node) HandleAppendEntriesResponse(peer string, sentUpTo uint64, resp *r
 }
 
 // handleInstallSnapshotResponse advances follower progress after a snapshot.
-func (n *Node) handleInstallSnapshotResponse(peer string, snapIndex uint64, resp *raftpb.InstallSnapshotResponse) {
+func (n *Node) handleInstallSnapshotResponse(peer string, snapIndex uint64, resp *raftpb.InstallSnapshotResponse, readGen uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.state != Leader {
+		n.failPendingReadsLocked(ErrNotLeader)
 		return
 	}
 	if resp.Term > n.currentTerm {
@@ -352,8 +405,12 @@ func (n *Node) handleInstallSnapshotResponse(peer string, snapIndex uint64, resp
 		n.state = Follower
 		n.votedFor = ""
 		_ = n.persistHardStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 		return
 	}
+	// Snapshot delivery is also a post-capture request at our term: its
+	// response confirms a ReadIndex round like any AppendEntries reply.
+	n.noteReadAckLocked(readGen, peer, resp.Term)
 	if snapIndex > n.matchIndex[peer] {
 		n.matchIndex[peer] = snapIndex
 	}

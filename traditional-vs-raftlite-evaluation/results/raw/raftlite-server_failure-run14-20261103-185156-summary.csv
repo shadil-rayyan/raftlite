@@ -1,0 +1,2 @@
+run_id,after_recovery_failed,after_recovery_succeeded,baseline_failed,baseline_succeeded,blocked_status_during_outage,component,data_path_ok_during_outage,during_outage_attempted,during_outage_failed,during_outage_succeeded,outage_ms,policies_complete,recovery_ms
+14,6,28,0,33,429,node1,true,33,0,33,4637.82,94,157.37

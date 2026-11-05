@@ -85,6 +85,12 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 <tbody id="topology"></tbody></table>
 </div>
 <div class="card">
+<h2>Raft Consensus Events <span class="muted">(this node's view — elections, leadership, term changes)</span></h2>
+<table><thead><tr><th>Time</th><th>Event</th><th>Term</th><th>Detail</th></tr></thead>
+<tbody id="raftEventsBody"></tbody></table>
+<div id="raftEventsEmpty" class="muted">no events yet</div>
+</div>
+<div class="card">
 <h2>Create IP Block</h2>
 <div class="row">
 <input id="ip" placeholder="IP or CIDR">
@@ -151,7 +157,7 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 </section>
 
 <section id="gateways" class="panel">
-<div class="muted" style="margin-bottom:10px">SIMULATED gateways — acceptance is simulated by the mock adapter and does not verify real network enforcement.</div>
+<div class="muted" style="margin-bottom:10px">Simulated fleet — mock gateways fake acceptance only; envoy-sim gateways (cmd/simgw) are real proxies that pull configuration, and their enforcement is verified by active probes through the actual data path.</div>
 <div class="grid">
 <div class="card"><div class="label">Total Gateways</div><div class="stat" id="gwTotal">-</div></div>
 <div class="card"><div class="label">Online</div><div class="stat" id="gwOnline">-</div></div>
@@ -164,12 +170,19 @@ pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;paddi
 </div>
 <div class="card">
 <h2>Gateways</h2>
-<table><thead><tr><th>ID</th><th>Name</th><th>Status</th><th>Desired</th><th>Reported</th><th>State</th><th>Verification</th><th>Last Error</th></tr></thead>
+<table><thead><tr><th>ID</th><th>Name</th><th>Adapter</th><th>Status</th><th>Desired</th><th>Reported</th><th>State</th><th>Verification</th><th>Last Error</th></tr></thead>
 <tbody id="gatewaysBody"></tbody></table>
+</div>
+<div class="card">
+<h2>Policy Enforcement Status (probe-verified through the data path)</h2>
+<div id="policyStatusBody" class="muted">no policies yet</div>
 </div>
 <div class="card" id="gwDetailCard" style="display:none">
 <h2 id="gwDetailTitle">Gateway Detail</h2>
 <pre id="gwDetail">-</pre>
+<h2>Enforcement on This Gateway <span class="muted">(policies it should be enforcing + probe result)</span></h2>
+<table><thead><tr><th>Policy</th><th>Target</th><th>Type</th><th>Revision</th><th>Result</th><th>Verified At</th><th>Error</th></tr></thead>
+<tbody id="gwDetailEnforcement"></tbody></table>
 <h2>Recent Events</h2>
 <table><thead><tr><th>Time</th><th>Type</th><th>Result</th><th>Revision</th><th>Error</th></tr></thead>
 <tbody id="gwDetailEvents"></tbody></table>
@@ -303,6 +316,8 @@ async function refresh(){
     }
     const a = await request('/v1/audit?limit=50');
     if(a.ok) renderAudit(a.data.entries || []);
+    const ce = await request('/v1/cluster/events?limit=50');
+    if(ce.ok) renderRaftEvents(ce.data.events || []);
     const m = await fetch('/metrics'); const mt = await m.text();
     $('metricsText').textContent = mt;
     renderMetrics(mt);
@@ -345,6 +360,20 @@ function renderAudit(entries){
   entries.slice().reverse().forEach(e=>{
     const tr = document.createElement('tr');
     tr.innerHTML = '<td>'+esc(e.timestamp)+'</td><td>'+esc(e.actor)+'</td><td>'+esc(e.operation)+'</td><td>'+esc(e.target)+'</td><td>'+esc(e.outcome)+'</td><td>'+esc(e.raft_index)+'</td>';
+    tb.appendChild(tr);
+  });
+}
+function renderRaftEvents(events){
+  const tb = $('raftEventsBody'); if(!tb) return;
+  tb.innerHTML = '';
+  const empty = $('raftEventsEmpty');
+  if(empty) empty.style.display = events.length ? 'none' : 'block';
+  const cls = {leader_elected:'ok', election_started:'warn', term_bumped:'err', vote_granted:'ok', leader_observed:'ok'};
+  events.forEach(e=>{
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(new Date(e.timestamp).toLocaleTimeString())+'</td>'+
+      '<td><span class="badge '+(cls[e.type]||'')+'">'+esc(e.type)+'</span></td>'+
+      '<td>'+esc(e.term)+'</td><td>'+esc(e.detail||'')+'</td>';
     tb.appendChild(tr);
   });
 }
@@ -527,6 +556,36 @@ async function runTests(){
   $('testResults').innerHTML = html;
 }
 let fleetGws = [];
+function verifBadge(v){
+  const cls = {verified:'ok', failed:'err', unknown:'warn'}[v] || '';
+  return '<span class="badge '+cls+'">'+esc(v || 'not_tested')+'</span>';
+}
+function achievedBadge(gw){
+  const id = esc(gw.gateway_id);
+  if(gw.connection_status === 'offline') return '<span class="badge err">'+id+' offline</span>';
+  const pv = gw.policy_verification;
+  if(pv && pv.result === 'verified') return '<span class="badge ok">'+id+' achieved</span>';
+  if(pv && pv.result === 'failed') return '<span class="badge err">'+id+' not achieved</span>';
+  return '<span class="badge">'+id+' not tested</span>';
+}
+async function refreshPolicyStatus(){
+  const el = $('policyStatusBody');
+  const pols = await request('/v1/policies');
+  if(!pols.ok){ el.textContent = 'policy list unavailable'; return; }
+  const active = (pols.data.policies || []).filter(p => p.status === 'active');
+  if(!active.length){ el.textContent = 'no active policies'; return; }
+  const rows = [];
+  for(const p of active){
+    const st = await request('/v1/fleet/policies/'+encodeURIComponent(p.id)+'/status');
+    let cells = '<span class="muted">fleet status unavailable</span>';
+    if(st.ok){
+      const gws = st.data.gateways || [];
+      cells = gws.length ? gws.map(achievedBadge).join(' ') : '<span class="muted">no gateways registered</span>';
+    }
+    rows.push('<tr><td>'+esc(p.id)+'</td><td>'+esc(p.target)+'</td><td>'+esc(p.type||'ip_block')+'</td><td>'+cells+'</td></tr>');
+  }
+  el.innerHTML = '<table><thead><tr><th>Policy</th><th>Target</th><th>Type</th><th>Enforcement per gateway</th></tr></thead><tbody>'+rows.join('')+'</tbody></table>';
+}
 function gwState(g){
   if(g.connection_status === 'offline') return 'offline';
   if(g.last_rejected_revision != null && g.last_rejected_revision === g.desired_revision) return 'rejected';
@@ -552,15 +611,16 @@ async function refreshFleet(){
     const tr = document.createElement('tr');
     tr.style.cursor = 'pointer';
     tr.onclick = function(){ gwDetail(x.id); };
-    tr.innerHTML = '<td>'+esc(x.id)+'</td><td>'+esc(x.name)+'</td><td>'+gwStateBadge(x.connection_status)+
+    tr.innerHTML = '<td>'+esc(x.id)+'</td><td>'+esc(x.name)+'</td><td>'+esc(x.adapter_type)+'</td><td>'+gwStateBadge(x.connection_status)+
       '</td><td>'+esc(x.desired_revision)+'</td><td>'+esc(x.reported_accepted_revision)+'</td><td>'+
-      gwStateBadge(gwState(x))+'</td><td>'+esc(x.verification)+'</td><td>'+esc(x.last_error ? x.last_error.code : '')+'</td>';
+      gwStateBadge(gwState(x))+'</td><td>'+verifBadge(x.verification)+'</td><td>'+esc(x.last_error ? x.last_error.code : '')+'</td>';
     tb.appendChild(tr);
   });
   const r = await request('/v1/fleet/rollouts');
   if(r.ok) renderRollout((r.data.rollouts || [])[0]);
   const e = await request('/v1/fleet/events?limit=50');
   renderFleetEvents(e.ok ? (e.data.events || []) : []);
+  refreshPolicyStatus();
 }
 function renderRollout(ro){
   const el = $('rolloutPanel');
@@ -593,6 +653,16 @@ async function gwDetail(id){
   $('gwDetailCard').style.display = 'block';
   $('gwDetailTitle').textContent = 'Gateway Detail — ' + id + ' (SIMULATED)';
   $('gwDetail').textContent = JSON.stringify(r.data.gateway, null, 2);
+  const en = $('gwDetailEnforcement'); en.innerHTML = '';
+  (r.data.enforcement || []).forEach(function(p){
+    const cls = {verified:'ok', failed:'err'}[p.result] || '';
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td>'+esc(p.policy_id)+'</td><td>'+esc(p.target)+'</td><td>'+esc(p.type)+'</td><td>'+esc(p.revision)+'</td>'+
+      '<td><span class="badge '+cls+'">'+esc(p.result)+'</span></td>'+
+      '<td>'+esc(p.verified_at ? new Date(p.verified_at).toLocaleTimeString() : '-')+'</td>'+
+      '<td>'+esc(p.error ? p.error.code+' '+p.error.message : '')+'</td>';
+    en.appendChild(tr);
+  });
   const tb = $('gwDetailEvents'); tb.innerHTML = '';
   (r.data.events || []).forEach(function(e){
     const tr = document.createElement('tr');

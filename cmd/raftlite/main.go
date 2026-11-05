@@ -9,6 +9,9 @@
 //	PEERS                comma-separated voter IDs         (default node1,node2,node3)
 //	PEER_ADDRS           id=host:port pairs for the gRPC transport
 //	ADMIN_PEER_ADDRS     id=http-base-url pairs for 307 redirects
+//	ADMIN_INTERNAL_PEER_ADDRS
+//	                     id=http-base-url pairs for server-to-server forwarding
+//	                     (in-network URLs; falls back to ADMIN_PEER_ADDRS)
 //	WAL_PATH             write-ahead log path              (default /tmp/raftlite.wal)
 //	SNAPSHOT_DIR         snapshot directory                (default dirname(WAL_PATH)/snapshots)
 //	RAFTLITE_ADMIN_TOKEN bearer token for mutating admin calls; empty disables auth (dev only)
@@ -124,12 +127,25 @@ func main() {
 	// ---- admin API ----
 	api := server.NewAPI(node, fsm, auditLog, adminToken, logger)
 	api.SetPeerAdminAddrs(parsePeerAddrs(os.Getenv("ADMIN_PEER_ADDRS")))
+	// In-network admin URLs for server-to-server forwarding (containers
+	// cannot reach a peer's localhost:8081). Optional: falls back to
+	// ADMIN_PEER_ADDRS when unset.
+	if v := os.Getenv("ADMIN_INTERNAL_PEER_ADDRS"); v != "" {
+		api.SetInternalPeerAdminAddrs(parsePeerAddrs(v))
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	// ---- gateway fleet (leader-owned, in-memory simulation) ----
 	fleetMgr := fleet.NewManager(fleet.NewMockAdapter(), logger)
 	defer fleetMgr.Stop()
 	api.SetFleetManager(fleetMgr)
 	api.SetDevMode(os.Getenv("RAFTLITE_DEV_UI") == "1")
+	// Enforcement verification: probes envoy-sim gateways' data paths so
+	// operators see whether policies are actually achieved, not just
+	// accepted. Runs on every node; only the leader does work.
+	api.StartFleetVerifier(ctx.Done())
 
 	mux := http.NewServeMux()
 	mux.Handle("/", api.Handler())
@@ -172,9 +188,6 @@ func main() {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	go func() {
 		logger.Info("raftlite starting",

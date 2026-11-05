@@ -97,14 +97,23 @@ paths:
   /v1/policies:
     get:
       summary: List policies
+      description: |
+        Linearizable by default: the leader confirms a quorum heartbeat
+        (ReadIndex) before answering; followers forward to the leader,
+        redirect, or respond 503 — never a silently stale view. Pass
+        `consistency=stale` for the local, possibly-lagging view.
       parameters:
         - in: query
           name: include_inactive
           schema: { type: string, enum: ["1"] }
           description: Include revoked and expired policies.
+        - in: query
+          name: consistency
+          schema: { type: string, enum: ["stale"] }
+          description: "`stale` serves the local FSM without a leader round trip."
       responses:
         "200":
-          description: Policies visible at this node, sorted by id
+          description: Policies at this node's read barrier (leader-confirmed unless `stale`), sorted by id
           content:
             application/json:
               schema:
@@ -114,7 +123,9 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Policy" }
                   revision: { type: integer, format: int64 }
+        "307": { $ref: "#/components/responses/NotLeader" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
   /v1/policies/ip-blocks:
     post:
@@ -198,18 +209,29 @@ paths:
         schema: { type: string }
     get:
       summary: Get one policy (including revoked/expired)
+      description: |
+        Linearizable by default (leader confirms via ReadIndex; followers
+        forward/redirect or 503). Pass `consistency=stale` for the local
+        view.
+      parameters:
+        - in: query
+          name: consistency
+          schema: { type: string, enum: ["stale"] }
+          description: "`stale` serves the local FSM without a leader round trip."
       responses:
         "200":
           description: The policy
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Policy" }
+        "307": { $ref: "#/components/responses/NotLeader" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404":
           description: No such policy
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
     delete:
       summary: Revoke a policy
       description: |
@@ -250,15 +272,23 @@ paths:
   /v1/blocked/{ip}:
     get:
       summary: Enforcement lookup for one address
+      description: |
+        Linearizable by default (leader confirms via ReadIndex; followers
+        forward/redirect or 503). Pass `consistency=stale` for the local
+        view.
       parameters:
         - in: path
           name: ip
           required: true
           schema: { type: string }
           description: IPv4 or IPv6 address (not CIDR).
+        - in: query
+          name: consistency
+          schema: { type: string, enum: ["stale"] }
+          description: "`stale` serves the local FSM without a leader round trip."
       responses:
         "200":
-          description: Lookup result at this node's applied revision
+          description: Lookup result at the read barrier (leader-confirmed unless `stale`)
           content:
             application/json:
               schema:
@@ -274,12 +304,14 @@ paths:
                   policy_id:
                     type: string
                     description: The winning policy under §7.2 precedence, if blocked.
+        "307": { $ref: "#/components/responses/NotLeader" }
         "400":
           description: Path segment is not an IP address
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "503": { $ref: "#/components/responses/ReadUnavailable" }
 
 components:
   securitySchemes:
@@ -293,6 +325,21 @@ components:
   responses:
     Unauthorized:
       description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotLeader:
+      description: Not the leader; resend the read request to `Location`
+      headers:
+        Location: { schema: { type: string } }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ReadUnavailable:
+      description: |
+        The linearizable read could not be served: no leader is known or
+        reachable from this node, or leadership confirmation failed.
+        Retry; pass `consistency=stale` to opt into a local read.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

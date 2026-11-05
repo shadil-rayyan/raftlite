@@ -33,6 +33,13 @@ func (m *Manager) startRollout(rev uint64, policyID, trigger string, targets []s
 		if !ok {
 			continue
 		}
+		if rev > gw.DesiredRevision && gw.AdapterType == AdapterEnvoySim {
+			// Enforcement of the previous revision is no longer the
+			// question being asked; probes for the new revision start
+			// from not_tested.
+			gw.Verification = VerifUntested
+			delete(m.verif, id)
+		}
 		gw.DesiredRevision = rev
 		gw.LastUpdateAt = now
 		res := &RolloutResult{GatewayID: id, Status: RollPending, Revision: rev}
@@ -220,9 +227,9 @@ func rolloutIDOr(ro *Rollout) string {
 	return ro.ID
 }
 
-// heartbeatLoop keeps last_heartbeat_at fresh for online gateways.
-// ponytail: operator-driven offline only; automatic connectivity-loss
-// detection from heartbeat age is the documented upgrade path.
+// heartbeatLoop keeps last_heartbeat_at fresh for simulated (mock)
+// gateways and detects connectivity loss for pull-based gateways from
+// heartbeat age.
 func (m *Manager) heartbeatLoop() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
@@ -231,14 +238,47 @@ func (m *Manager) heartbeatLoop() {
 		case <-m.stopCh:
 			return
 		case <-t.C:
-			now := time.Now().UTC()
-			m.mu.Lock()
-			for _, gw := range m.gateways {
-				if gw.ConnectionStatus == StatusOnline {
-					gw.LastHeartbeatAt = now
-				}
-			}
-			m.mu.Unlock()
+			m.sweepHeartbeats(time.Now().UTC())
 		}
 	}
+}
+
+// sweepHeartbeats applies one liveness pass. Mock gateways get simulated
+// heartbeats (they have no real process behind them). Pull-based
+// (envoy-sim) gateways get NO fabricated liveness: a gateway that has not
+// polled or reported within the heartbeat window is classified offline —
+// automatic connectivity-loss detection (FR-020/FR-021).
+func (m *Manager) sweepHeartbeats(now time.Time) {
+	m.mu.Lock()
+	var lost []string
+	for _, gw := range m.gateways {
+		if gw.AdapterType == AdapterEnvoySim {
+			if gw.ConnectionStatus == StatusOnline && now.Sub(gw.LastHeartbeatAt) > m.heartbeatTimeout {
+				gw.ConnectionStatus = StatusOffline
+				gw.UpdatedAt = now
+				lost = append(lost, gw.ID)
+			}
+			continue
+		}
+		if gw.ConnectionStatus == StatusOnline {
+			gw.LastHeartbeatAt = now
+		}
+	}
+	m.mu.Unlock()
+	for _, id := range lost {
+		m.events.add(Event{Timestamp: now, GatewayID: id, Type: EvGatewayOffline, Result: StatusOffline,
+			Metadata: map[string]string{"reason": "heartbeat_lost"}})
+	}
+}
+
+// SetHeartbeatTimeout bounds how long a pull-based gateway may stay silent
+// before it is classified offline. Simulation control; the default is 15s.
+func (m *Manager) SetHeartbeatTimeout(d time.Duration) error {
+	if d < 50*time.Millisecond || d > 10*time.Minute {
+		return ErrInvalidTimeout
+	}
+	m.mu.Lock()
+	m.heartbeatTimeout = d
+	m.mu.Unlock()
+	return nil
 }

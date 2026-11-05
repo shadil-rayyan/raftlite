@@ -16,6 +16,7 @@ import (
 
 	"github.com/shadil/raftlite/internal/audit"
 	"github.com/shadil/raftlite/internal/consensus"
+	"github.com/shadil/raftlite/internal/fleet"
 	"github.com/shadil/raftlite/internal/transport"
 )
 
@@ -543,5 +544,104 @@ func TestUICountersAndLabTab(t *testing.T) {
 		if !strings.Contains(body, marker) {
 			t.Fatalf("ui missing %q", marker)
 		}
+	}
+}
+
+// TestUIGatewaysVerificationAndPolicyStatus pins the Gateways (Sim) tab's
+// enforcement-verification surface: the verification badge renderer, the
+// probe-verified policy status card, and the adapter column. These are the
+// markers an operator sees for "is the policy achieved, is it working".
+func TestUIGatewaysVerificationAndPolicyStatus(t *testing.T) {
+	t.Setenv("RAFTLITE_DEV_UI", "1")
+	node := &fakeNode{id: "n1", state: consensus.Follower, peers: []string{"n1"}}
+	api, _ := newTestAPI(t, node, "")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/ui", nil))
+	body := rec.Body.String()
+	for _, marker := range []string{
+		"data-tab=\"gateways\"",
+		"function verifBadge(",
+		"function achievedBadge(",
+		"async function refreshPolicyStatus(",
+		"id=\"policyStatusBody\"",
+		"probe-verified through the data path",
+		"<th>Adapter</th>",
+		"/v1/fleet/policies/",
+		"achieved",
+		"not achieved",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("ui missing %q", marker)
+		}
+	}
+}
+
+// TestUIRaftEventsAndEnforcement pins the demo surfaces on the Overview and
+// Gateways tabs: the Raft consensus event log (who became leader, when,
+// in which term) and the per-gateway enforcement table in the detail card.
+func TestUIRaftEventsAndEnforcement(t *testing.T) {
+	t.Setenv("RAFTLITE_DEV_UI", "1")
+	node := &fakeNode{id: "n1", state: consensus.Leader, peers: []string{"n1"}}
+	api, _ := newTestAPI(t, node, "")
+	rec := httptest.NewRecorder()
+	api.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/ui", nil))
+	body := rec.Body.String()
+	for _, marker := range []string{
+		// Raft consensus event log on Overview.
+		"Raft Consensus Events",
+		"id=\"raftEventsBody\"",
+		"id=\"raftEventsEmpty\"",
+		"function renderRaftEvents(",
+		"/v1/cluster/events?limit=50",
+		"leader_elected",
+		"term_bumped",
+		// Per-gateway enforcement table in the gateway detail card.
+		"id=\"gwDetailEnforcement\"",
+		"Enforcement on This Gateway",
+		"r.data.enforcement",
+		"p.verified_at",
+	} {
+		if !strings.Contains(body, marker) {
+			t.Fatalf("ui missing %q", marker)
+		}
+	}
+}
+
+// TestUIPolicyStatusJSONContract pins the JSON shape the dashboard's
+// refreshPolicyStatus() consumes: gateways rows with gateway_id,
+// connection_status, and policy_verification.result per policy.
+func TestUIPolicyStatusJSONContract(t *testing.T) {
+	node := &fakeNode{id: "n1", state: consensus.Leader, leader: "n1"}
+	api, _ := newFleetAPI(t, node, "", false)
+	h := api.Handler()
+
+	checker := &testChecker{}
+	ds := startDataPath(t, checker)
+	if rec := postJSON(t, h, "/v1/fleet/gateways", "",
+		map[string]any{"id": "simgw-1", "name": "edge", "adapter_type": "envoy-sim", "proxy_url": ds.URL}); rec.Code != http.StatusCreated {
+		t.Fatalf("register: %d", rec.Code)
+	}
+	if rec := postJSON(t, h, "/v1/policies/ip-blocks", "", map[string]any{"ip": "203.0.113.50"}); rec.Code != http.StatusCreated {
+		t.Fatalf("create policy: %d", rec.Code)
+	}
+	rev := gatewayApply(t, h, "simgw-1", checker)
+	gatewayReport(t, h, "simgw-1", rev, fleet.RollAccepted)
+	api.verifyFleetOnce(context.Background())
+
+	pols := decodeBody(t, getJSON(t, h, "/v1/policies", ""))
+	pid := pols["policies"].([]any)[0].(map[string]any)["id"].(string)
+	rec2 := getJSON(t, h, "/v1/fleet/policies/"+pid+"/status", "")
+	ps := decodeBody(t, rec2)
+	row, ok := ps["gateways"].([]any)[0].(map[string]any)
+	if !ok {
+		t.Fatalf("gateways rows missing: %v", ps)
+	}
+	// Fields the achievedBadge() renderer reads, verbatim.
+	if row["gateway_id"] != "simgw-1" || row["connection_status"] != "online" {
+		t.Fatalf("row fields the UI reads are wrong: %v", row)
+	}
+	pv, ok := row["policy_verification"].(map[string]any)
+	if !ok || pv["result"] != "verified" {
+		t.Fatalf("policy_verification.result must be verified: %v", row)
 	}
 }

@@ -49,10 +49,11 @@ assuming any `go` command works. Shell scripts (`scripts/*.sh`) are bash + Docke
 
 ## Architecture gotchas
 
-- **`internal/gateway/` is dead code**: the reverse proxy and sync.Pool
-  allocators are NOT wired into `cmd/raftlite/main.go`. The blocklist
-  middleware exists (with the SEC-007 trusted-proxy fix) but is mounted
-  nowhere. Don't assume gateway changes affect the binary.
+- **`internal/gateway/` is wired into `cmd/simgw` only** (the standalone
+  simulated Envoy): the blocklist middleware (with the SEC-007
+  trusted-proxy fix) and reverse proxy form its data path. It is still NOT
+  wired into `cmd/raftlite/main.go` — don't assume gateway changes affect
+  the control-plane binary.
 - The Raft implementation in `internal/consensus/` is **hand-rolled**; `go.mod`
   pulls in only gRPC/protobuf. There is no external Raft library.
 - **Membership is single-server-per-entry** (`membership.go`), committed
@@ -71,16 +72,31 @@ assuming any `go` command works. Shell scripts (`scripts/*.sh`) are bash + Docke
   `consensus.SetSnapshotDir`.
 - `StartGRPCServer` serves Raft RPC and the AI loopback on the same port; it
   takes `credentials.TransportCredentials` (nil = dev plaintext + warning).
+- **Raft event log** (`internal/consensus/events.go`) is per-node, in-memory,
+  bounded (500); `GET /v1/cluster/events` serves the **local** node's view and
+  is never forwarded to the leader — the dashboard shows whatever node served
+  the page. Nodes expose it via the optional `RaftEventView` interface (same
+  pattern as `DiagnosticsView`, so test fakes stay small).
 - Metrics (`internal/observability`) are **hand-rolled Prometheus text
   format** — deliberately no client_golang dependency; `/metrics` samples live
   node/FSM state at scrape time.
 - Admin API lives in `internal/server/api.go` (SRS §6.1); `cmd/raftlite/main.go`
   adds deprecated v0.1 aliases (`/block`, `/blocked/{ip}`, `/leader`) on top.
+- **`cmd/simgw/`** is the standalone simulated Envoy gateway: it registers
+  with the fleet API, pulls config (`GET /v1/fleet/gateways/{id}/config`),
+  applies it locally, reports via `POST .../report`, and enforces it on its
+  data path. `internal/server/verify.go` actively probes that data path —
+  probe outcomes are the ONLY thing that advances a gateway's `verification`
+  field (acceptance reports never do; the mock adapter never verifies).
+  Fleet state is leader-owned/in-memory, so simgw gateways pointed at a
+  follower rely on the existing `/v1/fleet/*` forward-to-leader path.
 - Env vars: `NODE_ID`, `RAFT_ADDR`, `RAFTLITE_ADDR`, `PEERS`, `PEER_ADDRS`
   (id=host:port pairs — **without it the node runs without peer RPCs and can
   never elect**), `ADMIN_PEER_ADDRS` (id=admin-URL pairs for 307 redirects),
-  `WAL_PATH`, `SNAPSHOT_DIR`, `RAFTLITE_ADMIN_TOKEN`, `RAFTLITE_AUDIT_LOG`,
-  `RAFT_TLS_CERT`/`RAFT_TLS_KEY`/`RAFT_TLS_CA` (inter-node mTLS).
+  `ADMIN_INTERNAL_PEER_ADDRS` (in-network admin URLs for server-to-server
+  forwarding; falls back to `ADMIN_PEER_ADDRS`), `WAL_PATH`, `SNAPSHOT_DIR`,
+  `RAFTLITE_ADMIN_TOKEN`, `RAFTLITE_AUDIT_LOG`, `RAFT_TLS_CERT`/`RAFT_TLS_KEY`/
+  `RAFT_TLS_CA` (inter-node mTLS).
 - Protobufs: `api/raft.proto` + `api/loopback.proto`; `api/openapi.yaml` is
   the admin API contract. Generated Go is committed under
   `api/go/{raftpb,loopbackpb}/` (protoc 5.28.2, protoc-gen-go 1.36.11).

@@ -48,6 +48,23 @@ type DiagnosticsView interface {
 	CommitIndex() uint64
 }
 
+// StorageHealthView exposes whether the node's last durability operation
+// succeeded — an operator needs to know WHY a node refuses votes or
+// acknowledgements, not just that it is unhealthy. Optional (same pattern
+// as DiagnosticsView) so test fakes stay small.
+type StorageHealthView interface {
+	StorageHealthy() bool
+	StorageError() string
+}
+
+// ReadView exposes the linearizable-read barrier (ReadIndex). Optional
+// (same pattern as DiagnosticsView): on nodes that implement it, the
+// leader confirms a read with a quorum heartbeat round before serving;
+// test fakes without it keep serving local reads.
+type ReadView interface {
+	ReadIndex(ctx context.Context) (uint64, error)
+}
+
 // API bundles handlers and dependencies.
 type API struct {
 	node      NodeView
@@ -56,9 +73,13 @@ type API struct {
 	log       *slog.Logger
 	token     string            // admin bearer token; empty = auth disabled (dev only)
 	peerAddrs map[string]string // peer ID -> admin base URL, for 307 redirects
-	client    *http.Client
-	fleet     *fleet.Manager // leader-owned gateway fleet; nil = fleet API off
-	dev       bool           // dev mode: expose /dev/mock-gateways controls
+	// internalAddrs maps peer IDs to in-network admin URLs used for
+	// server-to-server forwarding (containers reach each other by service
+	// name; browsers cannot). Optional — falls back to peerAddrs.
+	internalAddrs map[string]string
+	client        *http.Client
+	fleet         *fleet.Manager // leader-owned gateway fleet; nil = fleet API off
+	dev           bool           // dev mode: expose /dev/mock-gateways controls
 
 	// idempotency records request_id -> outcome for safe retries (FR-016).
 	mu   sync.Mutex
@@ -99,6 +120,7 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("GET /readyz", a.handleReadyz)
 	mux.HandleFunc("GET /v1/leader", a.handleLeader)
 	mux.HandleFunc("GET /v1/cluster", a.handleCluster)
+	mux.HandleFunc("GET /v1/cluster/events", a.handleClusterEvents)
 	mux.HandleFunc("GET /v1/node", a.handleNode)
 	mux.HandleFunc("GET /v1/diagnostics", a.handleDiagnostics)
 	mux.HandleFunc("GET /v1/audit", a.handleAudit)
@@ -211,12 +233,51 @@ func (a *API) handleLeader(w http.ResponseWriter, _ *http.Request) {
 
 func (a *API) handleCluster(w http.ResponseWriter, _ *http.Request) {
 	state := a.node.State()
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"node_id":   a.node.ID(),
 		"role":      state.String(),
 		"leader_id": a.node.LeaderID(),
 		"peers":     a.node.Peers(),
 		"revision":  a.fsm.Revision(),
+	}
+	if sh, ok := a.node.(StorageHealthView); ok {
+		out["storage_healthy"] = sh.StorageHealthy()
+		if !sh.StorageHealthy() {
+			out["storage_error"] = sh.StorageError()
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleClusterEvents serves this node's Raft-conscious event log:
+// elections, leadership observations, term bumps, votes, snapshots. Each
+// node records its own local view — that is what an operator debugs from
+// when asking "who became leader and why did this node step down".
+func (a *API) handleClusterEvents(w http.ResponseWriter, r *http.Request) {
+	limit := queryLimit(r, 100)
+	// Read role/term BEFORE the event snapshot. Leadership is established
+	// under the node lock (recordEvent runs before state=Leader becomes
+	// visible), so reading role first guarantees that a response claiming
+	// role=leader already contains that election's leader_elected event —
+	// the reverse order can serve a pre-election snapshot with a
+	// post-election role.
+	role := a.node.State().String()
+	leader := a.node.LeaderID()
+	term, commit := uint64(0), uint64(0)
+	if d, ok := a.node.(DiagnosticsView); ok {
+		term, commit = d.CurrentTerm(), d.CommitIndex()
+	}
+	var events []consensus.RaftEvent
+	if v, ok := a.node.(consensus.RaftEventView); ok {
+		events = v.RaftEvents(limit)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"node_id":      a.node.ID(),
+		"role":         role,
+		"leader_id":    leader,
+		"term":         term,
+		"commit_index": commit,
+		"events":       events,
 	})
 }
 
@@ -380,6 +441,9 @@ func (a *API) handleListPolicies(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, aerr)
 		return
 	}
+	if a.readGate(w, r) {
+		return
+	}
 	includeInactive := r.URL.Query().Get("include_inactive") == "1"
 	pols := a.fsm.List(time.Now(), includeInactive)
 	out := make([]map[string]any, 0, len(pols))
@@ -395,6 +459,9 @@ func (a *API) handleListPolicies(w http.ResponseWriter, r *http.Request) {
 func (a *API) handleGetPolicy(w http.ResponseWriter, r *http.Request) {
 	if _, aerr := a.authenticate(r); aerr.Code != "" {
 		writeErr(w, aerr)
+		return
+	}
+	if a.readGate(w, r) {
 		return
 	}
 	id := r.PathValue("id")
@@ -415,6 +482,9 @@ func (a *API) handleBlocked(w http.ResponseWriter, r *http.Request) {
 	addr, err := netip.ParseAddr(ipStr)
 	if err != nil {
 		writeErr(w, apiError{http.StatusBadRequest, "invalid_ip", "path segment must be an IP address"})
+		return
+	}
+	if a.readGate(w, r) {
 		return
 	}
 	dec := a.fsm.Lookup(addr.String(), time.Now())
@@ -466,9 +536,14 @@ func (a *API) propose(ctx context.Context, w http.ResponseWriter, r *http.Reques
 			return "rejected", 0, apiError{http.StatusServiceUnavailable, "no_leader", "no elected leader; retry shortly"}, ""
 		}
 		loc := ""
-		if base, ok := a.peerAddrs[leader]; ok && leader != a.node.ID() {
-			loc = base + r.URL.RequestURI()
-			if r.Header.Get("X-Raftlite-Forwarded") == "" && a.forwardToLeader(ctx, w, r, rawBody, base) {
+		if leader != a.node.ID() {
+			// Browser-facing URL for the307 fallback...
+			if base, ok := a.peerAddrs[leader]; ok {
+				loc = base + r.URL.RequestURI()
+			}
+			// ...in-network URL for server-side forwarding.
+			if base, ok := a.peerBase(leader); ok &&
+				r.Header.Get("X-Raftlite-Forwarded") == "" && a.forwardToLeader(ctx, w, r, rawBody, base) {
 				return "", 0, apiError{}, ""
 			}
 		}
@@ -537,10 +612,88 @@ func (a *API) forwardToLeader(ctx context.Context, w http.ResponseWriter, r *htt
 	return true
 }
 
+// readGate applies read-consistency policy to state reads (linearizable
+// reads). Returns true when the request has been handled — forwarded,
+// redirected, or an error written — and the caller must return; false
+// means proceed with the local FSM read.
+//
+// The default is linearizable:
+//   - on the leader: confirm leadership with a quorum-confirmed heartbeat
+//     round (ReadIndex), then read local state;
+//   - on a follower: forward the GET to the leader once (loop-safe via
+//     X-Raftlite-Forwarded), 307-redirect when only a public address is
+//     known, or 503 when no leader is reachable — never silently stale.
+//
+// ?consistency=stale opts into the documented eventually-consistent local
+// read on any node (the pre-Milestone-1 behavior).
+func (a *API) readGate(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Query().Get("consistency") == "stale" {
+		return false // explicitly stale: local read is what the caller asked for
+	}
+
+	if a.node.State() == consensus.Leader {
+		if rv, ok := a.node.(ReadView); ok {
+			ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+			defer cancel()
+			if _, err := rv.ReadIndex(ctx); err != nil {
+				writeErr(w, apiError{http.StatusServiceUnavailable, "read_unavailable",
+					"leadership could not be confirmed for a linearizable read; retry"})
+				return true
+			}
+		}
+		return false // leader (or a fake without ReadView): local read
+	}
+
+	// Follower: a linearizable read must be served by the leader.
+	leader := a.node.LeaderID()
+	if leader == "" || leader == a.node.ID() {
+		// No leader known — including a stale self-view (our cached
+		// leaderID still says us, but we are not the leader).
+		writeErr(w, apiError{http.StatusServiceUnavailable, "no_leader",
+			"no elected leader is known on this node; retry shortly"})
+		return true
+	}
+	if r.Header.Get("X-Raftlite-Forwarded") == "" {
+		if base, ok := a.peerBase(leader); ok &&
+			a.forwardToLeader(r.Context(), w, r, nil, base) {
+			return true
+		}
+	}
+	// Cannot proxy (already forwarded once, or the peer is unreachable):
+	// fall back to a browser-facing307 when we know one.
+	if base, ok := a.peerAddrs[leader]; ok {
+		writeErrRedirect(w, apiError{http.StatusTemporaryRedirect, "not_leader",
+			"leader is " + leader + "; resend the read to that node"},
+			base+r.URL.RequestURI())
+		return true
+	}
+	writeErr(w, apiError{http.StatusServiceUnavailable, "unreachable_leader",
+		"leader is " + leader + " but no admin address is configured (set ADMIN_PEER_ADDRS on this node)"})
+	return true
+}
+
 // SetPeerAdminAddrs maps peer IDs to their admin API base URLs so redirects
 // can point at the leader's exact address (FR-007).
 func (a *API) SetPeerAdminAddrs(addrs map[string]string) {
 	a.peerAddrs = addrs
+}
+
+// SetInternalPeerAdminAddrs maps peer IDs to in-network admin URLs (e.g.
+// http://node1:8080) for server-to-server forwarding. Browsers get the
+// redirect URLs from SetPeerAdminAddrs; containers cannot reach
+// localhost:8081 of a peer, so forwarding uses these when set.
+func (a *API) SetInternalPeerAdminAddrs(addrs map[string]string) {
+	a.internalAddrs = addrs
+}
+
+// peerBase resolves a peer's admin base URL for server-side forwarding:
+// in-network address first, browser-facing address as fallback.
+func (a *API) peerBase(peerID string) (string, bool) {
+	if base, ok := a.internalAddrs[peerID]; ok {
+		return base, true
+	}
+	base, ok := a.peerAddrs[peerID]
+	return base, ok
 }
 
 // handleNode returns this node's consensus state for dashboards and peer probes.

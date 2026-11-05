@@ -9,7 +9,6 @@ import (
 	"sync"
 
 	raftpb "github.com/shadil/raftlite/api/go/raftpb"
-	"github.com/shadil/raftlite/internal/transport"
 )
 
 // Snapshot file format: JSON envelope next to the WAL ("<wal>.snapshot").
@@ -71,6 +70,23 @@ func (n *Node) CheckSnapshot() {
 const snapshotThreshold = 1024 // entries
 
 // takeSnapshotLocked serializes FSM state and compacts the log prefix.
+// The ordering is a crash-safe transaction (FR-024):
+//
+//  1. Serialize FSM state — failure aborts, nothing changes.
+//  2. Persist the snapshot file atomically (temp+fsync+rename) — failure
+//     aborts: compacting the WAL without a durable snapshot would lose
+//     the committed prefix on restart.
+//  3. Compact the in-memory log to the base entry at the snapshot index.
+//  4. Drop the durable prefix atomically (WAL.CompactPrefix) — failure is
+//     safe: the full WAL is a superset that restore() accepts (it skips
+//     entries <= snapshotIndex); only reclamation is delayed, and it is
+//     reported through storage health.
+//
+// Crash windows: after (2) the durable state is old full log + new
+// snapshot (safe); mid-(4) CompactPrefix publishes atomically (old full
+// log or new compacted log — both safe). There is no instant where the
+// snapshot is missing while the prefix is gone.
+//
 // Caller holds n.mu.
 func (n *Node) takeSnapshotLocked() {
 	data, err := n.fsm.Snapshot()
@@ -86,27 +102,27 @@ func (n *Node) takeSnapshotLocked() {
 
 	if dir := snapshotDir(); dir != "" {
 		if err := writeSnapshotFile(dir, sanitizeID(n.id), env); err != nil {
-			// Persistence failed: keep serving from memory; log compaction
-			// is still safe because InstallSnapshot can rebuild from FSM.
-			_ = err
+			// Never compact past an unpersisted snapshot: the prefix must
+			// stay in the WAL so a restart can still rebuild it.
+			n.noteStorageFailureLocked("snapshot_write", err)
+			return
 		}
+		n.noteStorageSuccessLocked()
 	}
 
-	// Compact the log: keep a single base entry at the snapshot position.
+	// Compact the in-memory log: keep a single base entry at the snapshot
+	// position.
 	base := LogEntry{Index: idx, Term: term.Term}
 	oldBase := n.log[0].Index
 	n.log = append([]LogEntry{base}, n.log[idx-oldBase+1:]...)
 	n.snapshotIndex = idx
 	n.snapshotTerm = term.Term
+	n.recordEvent(term.Term, EvSnapshotTaken, "index="+itoa(idx))
 
-	// Rewrite durable log to drop compacted prefix. Truncate keeps entries
-	// <= toIndex, so we invert: write a fresh log via truncate+append of
-	// the surviving suffix.
-	_ = n.storage.Truncate(0)
-	for _, e := range n.log[1:] {
-		_ = n.storage.Append(transport.LogEntry{
-			Index: e.Index, Term: e.Term, Type: byte(e.Type), Data: e.Data,
-		})
+	// Reclaim the durable prefix atomically. Failure is non-fatal (see
+	// step 4 above) but must not be silent.
+	if err := n.storage.CompactPrefix(idx); err != nil {
+		n.noteStorageFailureLocked("wal_compact", err)
 	}
 }
 
@@ -213,10 +229,15 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 		n.currentTerm = req.Term
 		n.state = Follower
 		n.votedFor = ""
+		n.recordEvent(req.Term, EvTermBumped, "higher term seen in install snapshot; stepped down")
 		_ = n.persistHardStateLocked()
+		n.failPendingReadsLocked(ErrNotLeader)
 	}
 
-	n.leaderID = string(req.LeaderId)
+	if leader := string(req.LeaderId); leader != "" && leader != n.leaderID {
+		n.leaderID = leader
+		n.recordEvent(req.Term, EvLeaderObserved, "leader is "+leader+" (via snapshot)")
+	}
 	n.resetElectionTimer()
 
 	var env snapshotEnvelope
@@ -226,21 +247,51 @@ func (n *Node) HandleInstallSnapshot(req *raftpb.InstallSnapshotRequest) *raftpb
 	if env.LastIndex <= n.snapshotIndex {
 		return resp // stale snapshot
 	}
+
+	// Durability first, in crash-safe order (FR-024). Every failure below
+	// returns WITHOUT acknowledging and WITHOUT mutating memory, so a
+	// retried install always starts from a consistent state:
+	//
+	//  1. Persist the snapshot file (atomic temp+fsync+rename).
+	//  2. Drop the durable log past the snapshot point — Truncate keeps
+	//     entries <= toIndex, so this removes the divergent tail while a
+	//     follower that is merely behind is a no-op (its tail is already
+	//     below the snapshot index).
+	//  3. Restore the FSM (all-or-nothing) and adopt the new indexes.
+	//
+	// Crash between any steps leaves old log + new snapshot, or dropped
+	// tail + new snapshot — both safe, because restore() prefers the
+	// durable snapshot and skips the compacted prefix.
+	if dir := snapshotDir(); dir != "" {
+		if err := writeSnapshotFile(dir, sanitizeID(n.id), env); err != nil {
+			n.noteStorageFailureLocked("install_snapshot_write", err)
+			return resp // not applied, not acknowledged; leader re-sends
+		}
+	}
+	if err := n.storage.Truncate(env.LastIndex); err != nil {
+		// The divergent tail could not be dropped: adopting the snapshot
+		// in memory now would make this node acknowledge entries whose
+		// durable copies contradict them.
+		n.noteStorageFailureLocked("install_snapshot_truncate", err)
+		return resp // old log intact (or tail still present); leader re-sends
+	}
+	n.noteStorageSuccessLocked()
+
+	// Durable state is in place: adopt it in memory. Engine.Restore is
+	// all-or-nothing (unmarshal, then assign), so a failure here leaves
+	// the old state and can be retried.
 	if err := n.fsm.Restore(env.Data); err != nil {
+		n.noteStorageFailureLocked("install_snapshot_restore", err)
 		return resp
 	}
-
 	n.snapshotIndex = env.LastIndex
 	n.snapshotTerm = env.LastTerm
 	n.log = []LogEntry{{Index: env.LastIndex, Term: env.LastTerm}}
 	n.commitIndex = env.LastIndex
 	n.lastApplied = env.LastIndex
 
-	// Persist: snapshot file first, then reset durable log.
-	if dir := snapshotDir(); dir != "" {
-		_ = writeSnapshotFile(dir, sanitizeID(n.id), env)
-	}
-	_ = n.storage.Truncate(0) // drop old entries; log restarts at snapshot
+	// Refresh the hard-state commit hint. Best-effort: the hint only
+	// accelerates recovery, correctness does not depend on it.
 	_ = n.persistHardStateLocked()
 
 	resp.Term = n.currentTerm

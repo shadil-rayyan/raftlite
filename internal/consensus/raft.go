@@ -57,6 +57,7 @@ type MetricsSink interface {
 	SetAppliedIndex(uint64)
 	ObserveCommitLatency(seconds float64)
 	IncCommits()
+	IncStorageErrors()
 }
 
 type Node struct {
@@ -106,9 +107,31 @@ type Node struct {
 	// metrics is an optional observability sink (FR-030); nil-safe.
 	metrics MetricsSink
 
+	// events is the bounded Raft-conscious event log shown on the
+	// dashboard (elections, leadership, term bumps). Leaf-locked; safe to
+	// record while holding n.mu.
+	events *eventLog
+
+	// storageErr describes the most recent durability failure ("" =
+	// healthy). It is set by noteStorageFailureLocked and cleared by the
+	// next successful storage write. While set the node is flagged in
+	// events/metrics/diagnostics so operators can see WHY acknowledgements
+	// are being refused. Callers hold n.mu.
+	storageErr string
+
 	// heartbeatRunning guards against stacking heartbeat loops across
 	// rapid leader transitions (see startHeartbeatLoop).
 	heartbeatRunning bool
+
+	// readGen is the leadership-confirmation generation for ReadIndex
+	// (linearizable reads). It increments on every ReadIndex capture;
+	// send goroutines snapshot it at spawn and report it back with the
+	// response, so only acks to requests sent AFTER the read barrier was
+	// recorded can confirm it — a stale in-flight ack from before the
+	// capture must not count (see readindex.go for the safety argument).
+	readGen uint64
+	// readRounds holds in-flight confirmation rounds keyed by readGen.
+	readRounds map[uint64]*readRound
 }
 
 // SetMetrics attaches an observability sink. Call before Start.
@@ -146,8 +169,10 @@ func NewNode(id string, peers []string, clock transport.Clock,
 		nextIndex:          make(map[string]uint64),
 		matchIndex:         make(map[string]uint64),
 		proposeTimes:       make(map[uint64]time.Time),
+		readRounds:         make(map[uint64]*readRound),
 		resetTimerCh:       make(chan struct{}, 1),
 		shutdownCh:         make(chan struct{}),
+		events:             newEventLog(500),
 	}
 	n.restore()
 	return n
@@ -191,7 +216,16 @@ func (n *Node) restore() {
 		}
 		for _, e := range entries {
 			if e.Index <= n.snapshotIndex {
-				continue
+				continue // compacted prefix; the snapshot holds that state
+			}
+			// The durable log must be contiguous from the base. A hole or
+			// a duplicate record (interrupted compaction on older
+			// versions, crash mid-truncate) means everything from the gap
+			// on is uncommitted remnant — drop it; the leader
+			// re-replicates. logAt() indexes by position, so a
+			// non-contiguous entry would corrupt every later lookup.
+			if e.Index != n.log[len(n.log)-1].Index+1 {
+				break
 			}
 			n.log = append(n.log, LogEntry{
 				Index: e.Index, Term: e.Term,
@@ -211,9 +245,32 @@ func (n *Node) restore() {
 		n.commitIndex = hint
 	}
 	n.applyCommitted()
+
+	// Record a restore only when there was durable state to restore — a
+	// brand-new node has nothing to report.
+	if hs.Term > 0 || n.snapshotIndex > 0 || len(n.log) > 1 {
+		n.recordEvent(n.currentTerm, EvStateRestored,
+			"term="+itoa(hs.Term)+" log_tail="+itoa(lastIdx)+" snapshot="+itoa(n.snapshotIndex))
+	}
 }
 
 func (n *Node) ID() string { return n.id }
+
+// itoa formats a uint64 for event details without pulling strconv into
+// every call site.
+func itoa(v uint64) string {
+	if v == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for v > 0 {
+		i--
+		b[i] = byte('0' + v%10)
+		v /= 10
+	}
+	return string(b[i:])
+}
 
 func (n *Node) State() NodeState {
 	n.mu.Lock()
@@ -254,12 +311,70 @@ func (n *Node) Peers() []string {
 }
 
 // persistHardStateLocked records term/vote durably. Caller holds n.mu.
+// Every outcome is recorded: a failure marks the node unhealthy (raft event
+// + metric + diagnostics) so a swallowed disk error can never be silent
+// again, and a success clears the flag.
 func (n *Node) persistHardStateLocked() error {
-	return n.storage.SaveHardState(transport.HardState{
+	if err := n.storage.SaveHardState(transport.HardState{
 		Term:        n.currentTerm,
 		VotedFor:    n.votedFor,
 		CommitIndex: n.commitIndex,
-	})
+	}); err != nil {
+		n.noteStorageFailureLocked("save_hard_state", err)
+		return err
+	}
+	n.noteStorageSuccessLocked()
+	return nil
+}
+
+// noteStorageFailureLocked records a failed durability operation (WAL
+// append/truncate, hard-state write, snapshot file). The first failure of a
+// stretch raises a storage_error event; every failure bumps the metric.
+// Callers that grant votes or acknowledge entries must additionally treat
+// the returned error as authoritative (see HandleVoteRequest,
+// startElection, HandleAppendEntries). Caller holds n.mu.
+func (n *Node) noteStorageFailureLocked(op string, err error) {
+	if err == nil {
+		return
+	}
+	entered := n.storageErr == ""
+	n.storageErr = op + ": " + err.Error()
+	// Event only on the healthy→unhealthy transition: a dead disk fails
+	// every heartbeat, and the bounded ring must not evict elections with
+	// storage noise. The metric counts every failure.
+	if entered {
+		n.recordEvent(n.currentTerm, EvStorageError, n.storageErr)
+	}
+	if n.metrics != nil {
+		n.metrics.IncStorageErrors()
+	}
+}
+
+// noteStorageSuccessLocked clears the unhealthy flag after a successful
+// storage write and records the recovery. Caller holds n.mu.
+func (n *Node) noteStorageSuccessLocked() {
+	if n.storageErr == "" {
+		return
+	}
+	n.storageErr = ""
+	n.recordEvent(n.currentTerm, EvStorageRecovered, "storage write succeeded after earlier failure")
+}
+
+// StorageHealthy reports whether the last durability operation succeeded.
+// Exposed for diagnostics (/v1/cluster) so operators can see why a node is
+// refusing votes or acknowledgements.
+func (n *Node) StorageHealthy() bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.storageErr == ""
+}
+
+// StorageError returns the description of the most recent durability
+// failure ("" when healthy).
+func (n *Node) StorageError() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.storageErr
 }
 
 // Start runs the node. A single-node cluster elects itself immediately.
@@ -276,6 +391,7 @@ func (n *Node) Start() {
 		if err := n.storage.Append(transport.LogEntry{
 			Index: noop.Index, Term: noop.Term, Type: byte(noop.Type),
 		}); err != nil {
+			n.noteStorageFailureLocked("append_noop", err)
 			n.log = n.log[:len(n.log)-1]
 			n.state = Follower
 			n.mu.Unlock()
@@ -363,11 +479,13 @@ func (n *Node) Propose(data []byte) (uint64, error) {
 	}); err != nil {
 		// Storage failure: drop the entry and surface it. The node must not
 		// serve writes it cannot persist (docs/architecture/overview.md).
+		n.noteStorageFailureLocked("append", err)
 		n.log = n.log[:len(n.log)-1]
 		delete(n.proposeTimes, entry.Index)
 		n.mu.Unlock()
 		return 0, err
 	}
+	n.noteStorageSuccessLocked()
 	n.matchIndex[n.id] = entry.Index
 	n.nextIndex[n.id] = entry.Index + 1
 	n.broadcastAppendEntriesLocked()

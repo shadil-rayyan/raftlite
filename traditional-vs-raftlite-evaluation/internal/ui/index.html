@@ -1,0 +1,563 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RaftLite vs Traditional — Evaluation Dashboard</title>
+<style>
+  :root {
+    --bg: #0f141a; --panel: #171e26; --panel2: #1e2732; --border: #2b3644;
+    --text: #d8e1ea; --muted: #8496a8; --accent: #4fc3f7; --ok: #81c784;
+    --warn: #ffb74d; --err: #e57373;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px;
+           background: var(--panel); border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block;
+         background: var(--err); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  .badge { padding: 2px 9px; border-radius: 10px; font-size: 12px;
+           background: var(--panel2); border: 1px solid var(--border); }
+  .badge.trad { color: #ffb74d; border-color: #6b4c1a; }
+  .badge.raft { color: #4fc3f7; border-color: #1d5570; }
+  .badge.run  { color: #ba68c8; border-color: #5a2d63; }
+  main { display: grid; grid-template-columns: 320px 1fr; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border);
+           border-radius: 8px; padding: 14px 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+              color: var(--muted); margin: 0 0 10px; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  select, input, button { width: 100%; padding: 7px 10px; border-radius: 6px;
+        border: 1px solid var(--border); background: var(--panel2);
+        color: var(--text); font-size: 13px; }
+  button { cursor: pointer; font-weight: 600; margin-top: 10px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: #174a63; border-color: #2a6f92; color: #cdefff; }
+  button.danger  { background: #5a2330; border-color: #7c3344; color: #ffd9de; }
+  button.ghost   { background: transparent; }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+  .kv { display: flex; justify-content: space-between; padding: 3px 0;
+        font-size: 13px; border-bottom: 1px dashed #232d38; }
+  .kv span:first-child { color: var(--muted); }
+  .mono { font-family: Consolas, monospace; font-size: 12px; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .err { color: var(--err); } .warn { color: var(--warn); }
+  #progress { height: 8px; background: var(--panel2); border-radius: 4px;
+              overflow: hidden; margin: 8px 0; }
+  #progress > div { height: 100%; width: 0%; background: var(--accent);
+                    transition: width .25s; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px;
+       text-transform: uppercase; letter-spacing: .05em; }
+  tr.sel { background: #1d2b38; }
+  tbody tr { cursor: pointer; }
+  canvas { width: 100%; height: 260px; display: block; }
+  .legend { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px;
+            color: var(--muted); margin-top: 6px; }
+  .legend i { width: 10px; height: 10px; display: inline-block;
+              border-radius: 2px; margin-right: 4px; }
+  .cmp { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .cmp .card { background: var(--panel2); border: 1px solid var(--border);
+               border-radius: 6px; padding: 10px 12px; }
+  .cmp .card h3 { margin: 0 0 8px; font-size: 13px; }
+  #toast { position: fixed; bottom: 18px; right: 18px; background: #26313d;
+           border: 1px solid var(--border); border-radius: 6px; padding: 10px 14px;
+           display: none; max-width: 380px; z-index: 10; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .tabs button { margin: 0; padding: 5px 12px; font-size: 12px; }
+  .tabs button.active { background: #174a63; border-color: #2a6f92; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>RaftLite vs Traditional — Policy Propagation Evaluation</h1>
+    <div class="sub">same gateway, same datasets, same measurements — only the policy backend differs</div>
+  </div>
+  <div class="spacer"></div>
+  <span class="badge" id="sseBadge"><span class="dot" id="sseDot"></span>events</span>
+  <span class="badge" id="sysBadge">no system</span>
+  <span class="badge run hidden" id="runBadge">run active</span>
+</header>
+
+<main>
+  <!-- LEFT: controls -->
+  <section>
+    <div class="panel">
+      <h2>1 · Environment</h2>
+      <label>System</label>
+      <div class="row">
+        <select id="systemSel">
+          <option value="traditional">Traditional (central + SQLite)</option>
+          <option value="raftlite">RaftLite (3-node cluster + adapter)</option>
+        </select>
+      </div>
+      <div class="row">
+        <button class="primary" id="startBtn" onclick="startEnv()">Start environment</button>
+        <button class="danger" id="stopBtn" onclick="stopEnv()" disabled>Stop</button>
+      </div>
+      <div id="envInfo" style="margin-top:10px"></div>
+    </div>
+
+    <div class="panel">
+      <h2>2 · Experiment</h2>
+      <label>Experiment</label>
+      <select id="expSel" onchange="renderExpDesc()">
+        <option value="propagation">Propagation latency</option>
+        <option value="consistency">Consistency (correctness)</option>
+      </select>
+      <div class="muted" id="expDesc" style="font-size:12px;margin-top:6px"></div>
+      <label>Dataset</label>
+      <select id="dsSel"><option>loading…</option></select>
+      <label>Submit rate (policies / sec)</label>
+      <input id="rateInp" type="number" min="1" max="10000" value="10">
+      <div class="row">
+        <button class="primary" id="runBtn" onclick="startRun()" disabled>Run experiment</button>
+        <button class="danger" id="cancelBtn" onclick="cancelRun()" disabled>Cancel</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Run history</h2>
+      <div id="history" class="muted" style="font-size:12px">no runs yet</div>
+    </div>
+  </section>
+
+  <!-- RIGHT: live view + results -->
+  <section>
+    <div class="panel">
+      <h2>Live — propagation latency per gateway</h2>
+      <div class="row">
+        <div class="kv"><span>submitted</span><b id="mSubmitted">0</b></div>
+        <div class="kv"><span>fully propagated</span><b id="mCompleted">0</b></div>
+        <div class="kv"><span>samples</span><b id="mSamples">0</b></div>
+      </div>
+      <div id="progress"><div></div></div>
+      <canvas id="chart"></canvas>
+      <div class="legend" id="legend"></div>
+    </div>
+
+    <div class="panel">
+      <div class="tabs">
+        <button class="active" id="tabLatest" onclick="showTab('latest')">Latest result</button>
+        <button id="tabCompare" onclick="showTab('compare')">Comparison</button>
+      </div>
+
+      <div id="latestPane">
+        <div id="latestEmpty" class="muted">No result yet — run an experiment.</div>
+        <div id="latestBody" class="hidden">
+          <div id="latestHead" class="muted" style="margin-bottom:8px"></div>
+          <table id="statsTable">
+            <thead><tr>
+              <th>gateway</th><th>n</th><th>mean</th><th>median</th><th>min</th>
+              <th>max</th><th>stddev</th><th>P95</th><th>P99</th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+          <div id="extraBox" style="margin-top:10px"></div>
+        </div>
+      </div>
+
+      <div id="comparePane" class="hidden">
+        <div id="compareBody" class="muted">Run the same experiment on both systems to see them side by side.</div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const GW_COLORS = ["#4fc3f7", "#81c784", "#ffb74d", "#ba68c8", "#e57373", "#f06292"];
+
+const state = {
+  status: null,
+  exps: [],
+  datasets: [],
+  runs: [],          // summaries, newest last
+  selectedRun: null,
+  // live run
+  live: null,        // {runId, total, submitted, completed, series: {gw: [ms,...]}}
+};
+
+// ---------- utilities ----------
+function toast(msg, isErr) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.style.borderColor = isErr ? "#7c3344" : "#2b3644";
+  t.style.display = "block";
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.style.display = "none", 5000);
+}
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (_) {}
+  if (!r.ok) throw new Error((body && body.error) || (r.status + " " + r.statusText));
+  return body;
+}
+function fmt(v, digits) {
+  if (v === undefined || v === null) return "–";
+  return (typeof v === "number") ? v.toFixed(digits === undefined ? 1 : digits) : String(v);
+}
+
+// ---------- status polling ----------
+async function refreshStatus() {
+  try {
+    state.status = await api("/api/status");
+    renderStatus();
+  } catch (e) { /* server briefly down */ }
+}
+function renderStatus() {
+  const st = state.status || {};
+  const sys = st.system || "";
+  const badge = $("sysBadge");
+  badge.textContent = st.running ? (sys === "raftlite" ? "RaftLite cluster" :
+                     sys === "traditional" ? "Traditional server" : sys) : "no system";
+  badge.className = "badge " + (sys === "raftlite" ? "raft" : sys === "traditional" ? "trad" : "");
+  $("runBadge").classList.toggle("hidden", !st.run_active);
+
+  $("startBtn").disabled = !!st.running || !!st.run_active;
+  $("stopBtn").disabled = !st.running || !!st.run_active;
+  $("runBtn").disabled = !st.running || !!st.run_active;
+  $("cancelBtn").disabled = !st.run_active;
+  $("systemSel").disabled = !!st.running;
+
+  let html = "";
+  if (st.env_message) html += `<div class="kv err"><span>last error</span><span>${st.env_message}</span></div>`;
+  if (st.running) {
+    html += `<div class="kv"><span>backend</span><span class="mono">${st.backend_url}</span></div>`;
+    html += `<div class="kv"><span>components</span><span class="mono">${(st.components||[]).join(" · ")}</span></div>`;
+    html += `<div class="kv"><span>gateways</span><span>${(st.gateways||[]).map(g=>g.id).join(" · ")}</span></div>`;
+  }
+  $("envInfo").innerHTML = html || '<div class="muted" style="font-size:12px">Environment stopped.</div>';
+}
+
+async function startEnv() {
+  const sys = $("systemSel").value;
+  $("startBtn").disabled = true;
+  try {
+    toast("Starting " + sys + " environment… (RaftLite takes a few seconds to elect)");
+    await api("/api/env/start", {method: "POST", headers: {"Content-Type": "application/json"},
+                                 body: JSON.stringify({system: sys})});
+    toast("Environment ready.");
+  } catch (e) { toast("Start failed: " + e.message, true); }
+  refreshStatus();
+}
+async function stopEnv() {
+  try { await api("/api/env/stop", {method: "POST"}); toast("Environment stopped."); }
+  catch (e) { toast("Stop failed: " + e.message, true); }
+  refreshStatus();
+}
+
+// ---------- experiments ----------
+async function loadExperiments() {
+  state.exps = await api("/api/experiments");
+  renderExpDesc();
+}
+function renderExpDesc() {
+  const id = $("expSel").value;
+  const e = state.exps.find(x => x.id === id);
+  $("expDesc").textContent = e ? e.desc : "";
+}
+async function loadDatasets() {
+  state.datasets = await api("/api/datasets");
+  const sel = $("dsSel");
+  sel.innerHTML = "";
+  for (const d of state.datasets) {
+    const o = document.createElement("option");
+    o.value = d.file;
+    o.textContent = `${d.file} — ${d.policies} policies`;
+    if (d.policies === 1000) o.selected = true;   // professor's main config
+    sel.appendChild(o);
+  }
+  if (!state.datasets.length) sel.innerHTML = '<option>no datasets — run scripts/gen-datasets</option>';
+}
+
+async function startRun() {
+  const req = {
+    experiment: $("expSel").value,
+    dataset: $("dsSel").value,
+    rate: parseInt($("rateInp").value, 10) || 10,
+  };
+  try {
+    const r = await api("/api/runs", {method: "POST", headers: {"Content-Type": "application/json"},
+                                      body: JSON.stringify(req)});
+    toast("Run #" + r.run_id + " started.");
+  } catch (e) { toast("Could not start: " + e.message, true); }
+}
+async function cancelRun() {
+  try { await api("/api/runs/cancel", {method: "POST"}); toast("Cancelling…"); }
+  catch (e) { toast(e.message, true); }
+}
+
+// ---------- SSE ----------
+const es = new EventSource("/api/stream");
+es.onopen = () => { $("sseDot").classList.add("on"); };
+es.onerror = () => { $("sseDot").classList.remove("on"); };
+es.onmessage = ev => {
+  let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
+  handleEvent(msg);
+};
+
+function handleEvent(m) {
+  const d = m.data || {};
+  switch (m.type) {
+    case "env_status": refreshStatus(); break;
+    case "run_started":
+      state.live = {
+        runId: d.run_id, total: d.policies || 0, submitted: 0, completed: 0,
+        series: {}, label: `${d.experiment} · ${d.system} · ${d.dataset}`,
+      };
+      $("latestEmpty").classList.add("hidden");
+      $("latestBody").classList.add("hidden");
+      renderLive(); drawChart();
+      break;
+    case "policy_submitted":
+      if (state.live && d.run_id === state.live.runId) { state.live.submitted = d.index || (state.live.submitted + 1); renderLive(); }
+      break;
+    case "submit_failed":
+      toast(`submit failed for ${d.ip}: ${d.error}`, true);
+      break;
+    case "sample": {
+      if (!state.live || d.run_id !== state.live.runId) break;
+      const gw = d.gateway_id;
+      if (!state.live.series[gw]) state.live.series[gw] = [];
+      state.live.series[gw].push(d.latency_ms);
+      renderLive(); drawChart();
+      break;
+    }
+    case "policy_complete":
+      if (state.live && d.run_id === state.live.runId) { state.live.completed++; renderLive(); }
+      break;
+    case "run_finished":
+      toast(`Run #${d.run_id} finished.`);
+      state.live = null;
+      renderLive();
+      refreshStatus();
+      loadRuns().then(() => showRunDetail(d.run_id));
+      break;
+    case "run_error":
+      toast(`Run failed: ${d.error}`, true);
+      state.live = null; renderLive(); refreshStatus();
+      break;
+  }
+}
+
+function renderLive() {
+  const L = state.live;
+  if (!L) {
+    $("mSubmitted").textContent = "0";
+    $("mCompleted").textContent = "0";
+    $("mSamples").textContent = "0";
+    $("progress").firstElementChild.style.width = "0%";
+    $("legend").innerHTML = "";
+    return;
+  }
+  $("mSubmitted").textContent = `${L.submitted} / ${L.total}`;
+  $("mCompleted").textContent = L.completed;
+  let n = 0;
+  for (const k in L.series) n += L.series[k].length;
+  $("mSamples").textContent = n;
+  $("progress").firstElementChild.style.width =
+    (L.total ? Math.min(100, 100 * L.completed / L.total) : 0) + "%";
+  const gws = Object.keys(L.series).sort();
+  $("legend").innerHTML = gws.map((g, i) =>
+    `<span><i style="background:${GW_COLORS[i % GW_COLORS.length]}"></i>${g}</span>`).join("");
+}
+
+// ---------- chart ----------
+function drawChart() {
+  const cv = $("chart");
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w * dpr; cv.height = h * dpr;
+  const ctx = cv.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, w, h);
+
+  const L = state.live;
+  const pad = {l: 44, r: 8, t: 8, b: 20};
+  if (!L) {
+    ctx.fillStyle = "#8496a8"; ctx.font = "12px sans-serif";
+    ctx.fillText("waiting for samples…", pad.l + 8, h / 2);
+    return;
+  }
+  const gws = Object.keys(L.series).sort();
+  if (!gws.length) return;
+  let maxY = 0, maxX = 1;
+  for (const g of gws) {
+    const arr = L.series[g];
+    if (arr.length > maxX) maxX = arr.length;
+    for (const v of arr) if (v > maxY) maxY = v;
+  }
+  maxY = maxY * 1.1 || 1;
+  const px = i => pad.l + (w - pad.l - pad.r) * (i / maxX);
+  const py = v => h - pad.b - (h - pad.t - pad.b) * (v / maxY);
+
+  // grid + y labels
+  ctx.strokeStyle = "#232d38"; ctx.fillStyle = "#8496a8";
+  ctx.font = "10px Consolas, monospace"; ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const v = maxY * i / 4, y = py(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w - pad.r, y); ctx.stroke();
+    ctx.fillText(v.toFixed(0) + " ms", 4, y + 3);
+  }
+  ctx.fillText("samples →", w - 70, h - 6);
+
+  // one line per gateway
+  gws.forEach((g, gi) => {
+    const arr = L.series[g];
+    ctx.strokeStyle = GW_COLORS[gi % GW_COLORS.length];
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    arr.forEach((v, i) => {
+      const x = px(i), y = py(v);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+  });
+}
+window.addEventListener("resize", drawChart);
+
+// ---------- results ----------
+async function loadRuns() {
+  try { state.runs = await api("/api/runs"); } catch (_) { return; }
+  renderHistory();
+  renderCompare();
+}
+function renderHistory() {
+  const box = $("history");
+  if (!state.runs.length) { box.innerHTML = '<span class="muted">no runs yet</span>'; return; }
+  box.innerHTML = "<table><tbody>" + state.runs.slice().reverse().map(r => `
+    <tr onclick="showRunDetail(${r.run_id})" class="${state.selectedRun === r.run_id ? "sel" : ""}">
+      <td>#${r.run_id}</td>
+      <td>${r.system}</td>
+      <td>${r.experiment}</td>
+      <td class="muted">${r.dataset}</td>
+    </tr>`).join("") + "</tbody></table>";
+}
+async function showRunDetail(id) {
+  let r;
+  try { r = await api("/api/runs/" + id); } catch (e) { toast(e.message, true); return; }
+  state.selectedRun = id;
+  renderHistory();
+  showTab("latest");
+  $("latestEmpty").classList.add("hidden");
+  $("latestBody").classList.remove("hidden");
+  $("latestHead").textContent =
+    `Run #${r.run_id} — ${r.experiment} · ${r.system} · ${r.dataset} · ${r.duration_ms} ms` +
+    (r.csv_path ? ` · ${r.csv_path}` : "");
+
+  const tb = $("statsTable").querySelector("tbody");
+  tb.innerHTML = "";
+  const stats = r.stats || {};
+  for (const gw of Object.keys(stats).sort((a, b) => (a === "all") - (b === "all") || a.localeCompare(b))) {
+    const s = stats[gw];
+    const tr = document.createElement("tr");
+    if (gw === "all") tr.style.fontWeight = "700";
+    tr.innerHTML = `<td>${gw}</td><td>${s.n}</td><td>${fmt(s.mean_ms)}</td>
+      <td>${fmt(s.median_ms)}</td><td>${fmt(s.min_ms)}</td><td>${fmt(s.max_ms)}</td>
+      <td>${fmt(s.stddev_ms)}</td><td>${fmt(s.p95_ms)}</td><td>${fmt(s.p99_ms)}</td>`;
+    tb.appendChild(tr);
+  }
+
+  // extra (consistency counts, submit stats, …)
+  const extra = r.extra || {};
+  let html = '<div class="row" style="flex-wrap:wrap">';
+  for (const [k, v] of Object.entries(extra)) {
+    if (typeof v === "object" && v !== null) continue;
+    html += `<div class="kv" style="min-width:200px"><span>${k.replace(/_/g," ")}</span><b>${v}</b></div>`;
+  }
+  html += "</div>";
+  // per-gateway breakdowns for consistency
+  const pgc = extra.per_gateway_correct, pgm = extra.per_gateway_missing, pgi = extra.per_gateway_incorrect;
+  if (pgc) {
+    html += '<table style="margin-top:8px"><thead><tr><th>gateway</th><th>correct</th><th>missing</th><th>incorrect</th></tr></thead><tbody>';
+    for (const gw of Object.keys(pgc)) {
+      html += `<tr><td>${gw}</td><td class="ok">${pgc[gw]}</td>
+               <td class="${pgm[gw] ? "err" : "muted"}">${pgm[gw]||0}</td>
+               <td class="${pgi[gw] ? "err" : "muted"}">${pgi[gw]||0}</td></tr>`;
+    }
+    html += "</tbody></table>";
+  }
+  $("extraBox").innerHTML = html;
+}
+
+function renderCompare() {
+  const box = $("compareBody");
+  const latest = exp => ["propagation", "consistency"].includes(exp) ? exp : null;
+  const pick = sys => {
+    const rs = state.runs.filter(r => r.system === sys && r.experiment === $("expSel").value);
+    return rs.length ? rs[rs.length - 1] : null;
+  };
+  const t = pick("traditional"), rf = pick("raftlite");
+  if (!t && !rf) {
+    box.className = "muted";
+    box.textContent = "Run the same experiment on both systems to see them side by side.";
+    return;
+  }
+  box.className = "";
+  const exp = $("expSel").value;
+  const card = (r, title, color) => {
+    if (!r) return `<div class="card"><h3 style="color:${color}">${title}</h3>
+        <div class="muted">no run yet</div></div>`;
+    let rows = "";
+    const s = (r.stats && r.stats.all) || null;
+    if (s) {
+      rows = ["n","mean_ms","median_ms","min_ms","max_ms","stddev_ms","p95_ms","p99_ms"].map(k =>
+        `<div class="kv"><span>${k.replace("_ms","")}</span><b>${fmt(s[k], k==="n"?0:1)}</b></div>`).join("");
+    }
+    const e = r.extra || {};
+    if (exp === "consistency") {
+      rows += `<div class="kv"><span>gateways correct</span>
+        <b class="${e.gateways_correct === e.gateway_count ? "ok" : "err"}">${e.gateways_correct}/${e.gateway_count}</b></div>`;
+      rows += `<div class="kv"><span>missing policies</span><b>${sumMap(e.per_gateway_missing)}</b></div>`;
+      rows += `<div class="kv"><span>incorrect policies</span><b>${sumMap(e.per_gateway_incorrect)}</b></div>`;
+    } else {
+      rows += `<div class="kv"><span>complete policies</span><b>${e.policies_complete ?? "–"}/${e.policies_submitted ?? "–"}</b></div>`;
+      rows += `<div class="kv"><span>submit failures</span><b class="${e.submit_failures ? "err" : "ok"}">${e.submit_failures ?? 0}</b></div>`;
+    }
+    return `<div class="card"><h3 style="color:${color}">${title} — run #${r.run_id}</h3>${rows}</div>`;
+  };
+  box.innerHTML = `<div class="muted" style="margin-bottom:8px">
+      experiment: <b>${$("expSel").selectedOptions[0].textContent}</b> — latest run per system</div>
+    <div class="cmp">${card(t, "Traditional", "#ffb74d")}${card(rf, "RaftLite", "#4fc3f7")}</div>`;
+}
+function sumMap(m) {
+  if (!m) return 0;
+  return Object.values(m).reduce((a, b) => a + b, 0);
+}
+
+// ---------- tabs ----------
+function showTab(which) {
+  const latest = which === "latest";
+  $("latestPane").classList.toggle("hidden", !latest);
+  $("comparePane").classList.toggle("hidden", latest);
+  $("tabLatest").classList.toggle("active", latest);
+  $("tabCompare").classList.toggle("active", !latest);
+  if (!latest) renderCompare();
+}
+
+// ---------- init ----------
+(async function init() {
+  await Promise.all([loadExperiments(), loadDatasets(), refreshStatus(), loadRuns()]);
+  renderLive(); drawChart();
+  setInterval(refreshStatus, 2000);
+})();
+</script>
+</body>
+</html>

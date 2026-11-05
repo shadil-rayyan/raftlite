@@ -12,6 +12,26 @@ x-common-go: &common-go
   networks:
     - raftnet
 
+# Shared simulated-gateway config; each instance overrides id/name/listen/
+# control plane. Gateways deliberately point at DIFFERENT nodes: simgw-2
+# and simgw-3 poll followers, which forward fleet requests to the leader —
+# that exercises the three-node communication path.
+x-simgw: &simgw
+  build:
+    context: .
+    dockerfile: Dockerfile
+  entrypoint: ["/simgw"]
+  restart: unless-stopped
+  depends_on:
+    - echo
+  environment:
+    SIMGW_UPSTREAM: http://echo:5678
+    SIMGW_PROXY_URL: unused
+    SIMGW_TRUST_PROBE_SRC: 172.16.0.0/12
+    SIMGW_POLL_MS: "1000"
+  networks:
+    - raftnet
+
 services:
   node1:
     <<: *common-go
@@ -25,6 +45,7 @@ services:
       PEERS: node1,node2,node3
       PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
       ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
+      ADMIN_INTERNAL_PEER_ADDRS: node1=http://node1:8080,node2=http://node2:8080,node3=http://node3:8080
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal1:/data
@@ -42,6 +63,7 @@ services:
       PEERS: node1,node2,node3
       PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
       ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
+      ADMIN_INTERNAL_PEER_ADDRS: node1=http://node1:8080,node2=http://node2:8080,node3=http://node3:8080
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal2:/data
@@ -59,10 +81,83 @@ services:
       PEERS: node1,node2,node3
       PEER_ADDRS: node1=node1:9090,node2=node2:9090,node3=node3:9090
       ADMIN_PEER_ADDRS: node1=http://localhost:8081,node2=http://localhost:8082,node3=http://localhost:8083
+      ADMIN_INTERNAL_PEER_ADDRS: node1=http://node1:8080,node2=http://node2:8080,node3=http://node3:8080
       WAL_PATH: /data/raftlite.wal
     volumes:
       - wal3:/data
     cpuset: "2"
+
+  # Tiny upstream the simulated gateway proxies real traffic to.
+  echo:
+    image: hashicorp/http-echo:1.0
+    command: ["-text=ok", "-listen=:5678"]
+    restart: unless-stopped
+    networks:
+      - raftnet
+
+  # Standalone simulated Envoy gateways: pull policy revisions from the
+  # control plane, enforce them on their data path, and are probe-verified
+  # for enforcement. Three instances against DIFFERENT nodes: simgw-1 polls
+  # node1 (leader or follower), simgw-2 polls node2, simgw-3 polls node3 —
+  # follower-polling gateways exercise server-side forwarding to the leader.
+  # Trust note: probes come from the control plane containers, so the
+  # docker bridge range is trusted as a proxy hop — simulation only.
+  simgw-1:
+    <<: *simgw
+    depends_on:
+      - node1
+      - echo
+    environment:
+      SIMGW_ID: simgw-1
+      SIMGW_NAME: edge-1
+      SIMGW_LISTEN: :18080
+      SIMGW_ADMIN: :19901
+      SIMGW_CONTROL_PLANE: http://node1:8080
+      SIMGW_PROXY_URL: http://simgw-1:18080
+      SIMGW_UPSTREAM: http://echo:5678
+      SIMGW_TRUST_PROBE_SRC: 172.16.0.0/12
+      SIMGW_POLL_MS: "1000"
+    ports:
+      - "18080:18080"
+      - "19901:19901"
+
+  simgw-2:
+    <<: *simgw
+    depends_on:
+      - node2
+      - echo
+    environment:
+      SIMGW_ID: simgw-2
+      SIMGW_NAME: edge-2
+      SIMGW_LISTEN: :18080
+      SIMGW_ADMIN: :19901
+      SIMGW_CONTROL_PLANE: http://node2:8080
+      SIMGW_PROXY_URL: http://simgw-2:18080
+      SIMGW_UPSTREAM: http://echo:5678
+      SIMGW_TRUST_PROBE_SRC: 172.16.0.0/12
+      SIMGW_POLL_MS: "1000"
+    ports:
+      - "18081:18080"
+      - "19902:19901"
+
+  simgw-3:
+    <<: *simgw
+    depends_on:
+      - node3
+      - echo
+    environment:
+      SIMGW_ID: simgw-3
+      SIMGW_NAME: edge-3
+      SIMGW_LISTEN: :18080
+      SIMGW_ADMIN: :19901
+      SIMGW_CONTROL_PLANE: http://node3:8080
+      SIMGW_PROXY_URL: http://simgw-3:18080
+      SIMGW_UPSTREAM: http://echo:5678
+      SIMGW_TRUST_PROBE_SRC: 172.16.0.0/12
+      SIMGW_POLL_MS: "1000"
+    ports:
+      - "18082:18080"
+      - "19903:19901"
 
 volumes:
   wal1:

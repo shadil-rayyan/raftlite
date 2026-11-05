@@ -30,6 +30,11 @@ type Storage interface {
 	LastIndex() (uint64, error)
 	LastTerm() (uint64, error)
 	Truncate(toIndex uint64) error
+	// CompactPrefix drops every durable record with Index <= fromIndex,
+	// keeping the surviving suffix durable at every instant (atomic
+	// publish; a crash leaves either the old full log or the new compacted
+	// one). Backs snapshot log compaction.
+	CompactPrefix(fromIndex uint64) error
 	Sync() error
 	Close() error
 
@@ -103,6 +108,18 @@ func (m *MockStorage) Truncate(toIndex uint64) error {
 		}
 	}
 	m.entries = m.entries[:keep]
+	return nil
+}
+
+// CompactPrefix drops every entry with Index <= fromIndex (see Storage).
+func (m *MockStorage) CompactPrefix(fromIndex uint64) error {
+	keep := 0
+	for _, e := range m.entries {
+		if e.Index > fromIndex {
+			keep++
+		}
+	}
+	m.entries = append([]LogEntry(nil), m.entries[len(m.entries)-keep:]...)
 	return nil
 }
 

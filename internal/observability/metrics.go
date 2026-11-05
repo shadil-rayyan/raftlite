@@ -25,6 +25,7 @@ type Registry struct {
 	commitsTotal     atomic.Uint64
 	proposalRejected atomic.Uint64
 	proposalUncertain atomic.Uint64
+	storageErrorsTotal atomic.Uint64
 	rpcErrors        sync.Map // key: direction/type -> *atomic.Uint64
 
 	// gauges
@@ -84,6 +85,7 @@ func (r *Registry) IncElections()              { r.electionsTotal.Add(1) }
 func (r *Registry) IncCommits()                { r.commitsTotal.Add(1) }
 func (r *Registry) IncProposalRejected()       { r.proposalRejected.Add(1) }
 func (r *Registry) IncProposalUncertain()      { r.proposalUncertain.Add(1) }
+func (r *Registry) IncStorageErrors()          { r.storageErrorsTotal.Add(1) }
 func (r *Registry) SetLeader(v bool) {
 	if v {
 		r.isLeader.Store(1)
@@ -147,6 +149,8 @@ func (r *Registry) WriteMetrics(w io.Writer) {
 		"Total proposals rejected before entering the log", r.proposalRejected.Load())
 	r.emitCounter(w, "raftlite_proposals_uncertain_total",
 		"Total proposals whose commit outcome was not confirmed", r.proposalUncertain.Load())
+	r.emitCounter(w, "raftlite_storage_errors_total",
+		"Total durability operation failures (WAL append/truncate, hard state, snapshot)", r.storageErrorsTotal.Load())
 	r.emitGauge(w, "raftlite_is_leader",
 		"1 when this node is the current leader", r.isLeader.Load())
 	r.emitGauge(w, "raftlite_term",

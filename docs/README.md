@@ -69,6 +69,7 @@ How policies are represented and evaluated	Policy Model
 How the administrative API behaves	API Design
 How the dashboard UI works	UI Guide (docs/ui.md)
 How simulated gateways and rollouts work	Gateway Simulation (docs/gateway-simulation.md)
+How to run a full end-to-end demo	Demo Runbook (docs/demo.md)
 How persistence and recovery work	Data Storage Design
 How the product is deployed	Deployment Guide
 How to operate and monitor the system	Monitoring Guide

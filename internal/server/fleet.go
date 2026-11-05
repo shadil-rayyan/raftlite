@@ -29,6 +29,9 @@ func (a *API) registerFleetRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/fleet/gateways", a.handleFleetGateways)
 	mux.HandleFunc("GET /v1/fleet/gateways/{id}", a.handleFleetGateway)
 	mux.HandleFunc("GET /v1/fleet/gateways/{id}/events", a.handleFleetGatewayEvents)
+	mux.HandleFunc("GET /v1/fleet/gateways/{id}/config", a.handleGatewayConfig)
+	mux.HandleFunc("POST /v1/fleet/gateways/{id}/report", a.handleGatewayReport)
+	mux.HandleFunc("GET /v1/fleet/policies/{id}/status", a.handlePolicyStatus)
 	mux.HandleFunc("GET /v1/fleet/rollouts", a.handleFleetRollouts)
 	mux.HandleFunc("GET /v1/fleet/rollouts/{id}", a.handleFleetRollout)
 	mux.HandleFunc("GET /v1/fleet/events", a.handleFleetEvents)
@@ -37,8 +40,8 @@ func (a *API) registerFleetRoutes(mux *http.ServeMux) {
 	if a.dev {
 		mux.HandleFunc("POST /dev/mock-gateways", a.handleDevCreateGateway)
 		mux.HandleFunc("DELETE /dev/mock-gateways/{id}", a.handleDevDeleteGateway)
-	mux.HandleFunc("POST /dev/mock-gateways/{id}/scenarios/{action}", a.handleDevScenario)
-}
+		mux.HandleFunc("POST /dev/mock-gateways/{id}/scenarios/{action}", a.handleDevScenario)
+	}
 }
 
 // fleetGate checks role and forwards to the leader when this node is a
@@ -56,10 +59,10 @@ func (a *API) fleetGate(w http.ResponseWriter, r *http.Request) bool {
 		writeErr(w, apiError{http.StatusServiceUnavailable, "no_leader", "no elected leader; fleet state is unavailable"})
 		return true
 	}
-	base, ok := a.peerAddrs[leader]
+	base, ok := a.peerBase(leader)
 	if !ok || leader == a.node.ID() {
 		writeErr(w, apiError{http.StatusTemporaryRedirect, "not_leader",
-			"fleet state lives on the leader " + leader + "; set ADMIN_PEER_ADDRS to enable forwarding"})
+			"fleet state lives on the leader " + leader + "; set ADMIN_PEER_ADDRS (or ADMIN_INTERNAL_PEER_ADDRS) to enable forwarding"})
 		return true
 	}
 	// Capture the body so it survives both forwarding and local fallback.
@@ -154,8 +157,9 @@ func (a *API) handleFleetGateway(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"gateway": gw,
-		"events":  a.fleet.Events(50, id),
+		"gateway":    gw,
+		"events":     a.fleet.Events(50, id),
+		"enforcement": a.fleet.EnforcementFor(id),
 	})
 }
 
@@ -170,6 +174,108 @@ func (a *API) handleFleetGatewayEvents(w http.ResponseWriter, r *http.Request) {
 	limit := queryLimit(r, 100)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"events": a.fleet.Events(limit, r.PathValue("id")),
+	})
+}
+
+// handleGatewayConfig serves the configuration snapshot a pull-based
+// (envoy-sim) gateway applies. Polling also counts as the gateway's
+// heartbeat. A report of what it then applied arrives separately via
+// POST .../report — serving config never marks anything accepted.
+func (a *API) handleGatewayConfig(w http.ResponseWriter, r *http.Request) {
+	if _, aerr := a.authenticate(r); aerr.Code != "" {
+		writeErr(w, aerr)
+		return
+	}
+	if a.fleetGate(w, r) {
+		return
+	}
+	snap, ok := a.fleet.ConfigFor(r.PathValue("id"))
+	if !ok {
+		writeErr(w, apiError{http.StatusNotFound, "not_found", "no such pull-based gateway"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"revision": snap.Revision,
+		"policies": snap.Policies,
+	})
+}
+
+// gatewayReportRequest is one gateway's word about a revision it received.
+type gatewayReportRequest struct {
+	Revision uint64            `json:"revision"`
+	Status   string            `json:"status"` // accepted | rejected
+	Error    *fleet.EventError `json:"error,omitempty"`
+}
+
+// handleGatewayReport ingests an ACK/NACK from a pull-based gateway. The
+// report advances reported_accepted_revision only; enforcement verification
+// is a separate question answered by active probes (see verify.go).
+func (a *API) handleGatewayReport(w http.ResponseWriter, r *http.Request) {
+	if _, aerr := a.authenticate(r); aerr.Code != "" {
+		writeErr(w, aerr)
+		return
+	}
+	if a.fleetGate(w, r) {
+		return
+	}
+	var req gatewayReportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, apiError{http.StatusBadRequest, "invalid_json", "request body must be valid JSON"})
+		return
+	}
+	switch req.Status {
+	case fleet.RollAccepted, fleet.RollRejected:
+	default:
+		writeErr(w, apiError{http.StatusBadRequest, "invalid_status", "status must be accepted or rejected"})
+		return
+	}
+	err := a.fleet.HandleReport(r.PathValue("id"), req.Revision, req.Status, req.Error)
+	if err != nil {
+		status := http.StatusBadRequest
+		if err == fleet.ErrNotFound {
+			status = http.StatusNotFound
+		}
+		writeErr(w, apiError{status, "report_failed", err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded"})
+}
+
+// handlePolicyStatus answers "is this policy achieved across the fleet?" —
+// per gateway: desired vs applied revision and the enforcement-probe result
+// for this policy (never advanced by acceptance reports).
+func (a *API) handlePolicyStatus(w http.ResponseWriter, r *http.Request) {
+	if _, aerr := a.authenticate(r); aerr.Code != "" {
+		writeErr(w, aerr)
+		return
+	}
+	if a.fleetGate(w, r) {
+		return
+	}
+	id := r.PathValue("id")
+	rows := a.fleet.PolicyStatus(id)
+	summary := map[string]int{"total": len(rows), "applied": 0, "verified": 0, "failed": 0, "not_tested": 0, "offline": 0}
+	for _, row := range rows {
+		if row.ConnectionStatus == fleet.StatusOffline {
+			summary["offline"]++
+		}
+		if row.ReportedAcceptedRevision == row.DesiredRevision && row.DesiredRevision > 0 {
+			summary["applied"]++
+		}
+		switch {
+		case row.PolicyVerification != nil && row.PolicyVerification.Result == fleet.VerifVerified:
+			summary["verified"]++
+		case row.PolicyVerification != nil && row.PolicyVerification.Result == fleet.VerifFailed:
+			summary["failed"]++
+		default:
+			summary["not_tested"]++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"policy_id": id,
+		"revision":  a.fleet.CurrentRevision(),
+		"gateways":  rows,
+		"summary":   summary,
 	})
 }
 
@@ -204,6 +310,15 @@ type createGatewayRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	DelayMs     int    `json:"delay_ms,omitempty"`
+	// AdapterType selects the gateway kind: "mock" (default, in-process
+	// simulator) or "envoy-sim" (standalone cmd/simgw process that pulls
+	// configuration and reports outcomes itself).
+	AdapterType string `json:"adapter_type,omitempty"`
+	// ID and ProxyURL apply to envoy-sim gateways: the stable identity the
+	// gateway process uses and the data-path base URL the control plane
+	// probes for enforcement verification.
+	ID       string `json:"id,omitempty"`
+	ProxyURL string `json:"proxy_url,omitempty"`
 }
 
 func (a *API) handleCreateGateway(w http.ResponseWriter, r *http.Request) {
@@ -228,6 +343,14 @@ func (a *API) createGateway(w http.ResponseWriter, r *http.Request, actor string
 		writeErr(w, apiError{http.StatusBadRequest, "invalid_name", "name is required"})
 		return
 	}
+	if req.AdapterType == fleet.AdapterEnvoySim {
+		a.registerRealGateway(w, req, actor)
+		return
+	}
+	if req.AdapterType != "" && req.AdapterType != fleet.AdapterMock {
+		writeErr(w, apiError{http.StatusBadRequest, "invalid_adapter", "adapter_type must be mock or envoy-sim"})
+		return
+	}
 	delay := time.Duration(req.DelayMs) * time.Millisecond
 	gw, err := a.fleet.CreateGateway(req.Name, req.Description, delay)
 	if err != nil {
@@ -236,6 +359,30 @@ func (a *API) createGateway(w http.ResponseWriter, r *http.Request, actor string
 	}
 	a.auditEvent(actor, "create_gateway", gw.ID, req.Description, "", "committed", 0, "")
 	writeJSON(w, http.StatusCreated, map[string]any{"gateway": gw})
+}
+
+// registerRealGateway creates — or idempotently returns — a pull-based
+// envoy-sim gateway. Standalone gateway processes re-register on restart,
+// so an existing identity is not an error (200, not 409).
+func (a *API) registerRealGateway(w http.ResponseWriter, req createGatewayRequest, actor string) {
+	if req.ProxyURL == "" {
+		writeErr(w, apiError{http.StatusBadRequest, "invalid_proxy_url",
+			"proxy_url is required for envoy-sim gateways (the control plane probes it to verify enforcement)"})
+		return
+	}
+	gw, created, err := a.fleet.RegisterRealGateway(req.ID, req.Name, req.ProxyURL)
+	if err != nil {
+		writeErr(w, apiError{http.StatusConflict, "invalid_gateway", err.Error()})
+		return
+	}
+	if created {
+		a.auditEvent(actor, "create_gateway", gw.ID, req.Name, "", "committed", 0, "")
+	}
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	writeJSON(w, status, map[string]any{"gateway": gw, "existing": !created})
 }
 
 func (a *API) handleFleetReconcile(w http.ResponseWriter, r *http.Request) {

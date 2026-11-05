@@ -1,0 +1,9 @@
+# Local build artifacts and scratch — never committed.
+bin/
+work/
+*.db
+*.db-*
+measure.pid
+
+# Generated analysis outputs are kept (results/) but transient plots are not.
+results/graphs/

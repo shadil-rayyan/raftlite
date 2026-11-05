@@ -172,6 +172,9 @@ func TestFleetGatewayDetailAndErrors(t *testing.T) {
 	if _, ok := body["events"].([]any); !ok {
 		t.Fatal("detail must include events")
 	}
+	if en, ok := body["enforcement"].([]any); !ok || en == nil {
+		t.Fatalf("detail must include enforcement rows: %v", body)
+	}
 	if rec := getJSON(t, h, "/v1/fleet/gateways/nope", ""); rec.Code != http.StatusNotFound {
 		t.Fatalf("unknown gateway: %d", rec.Code)
 	}

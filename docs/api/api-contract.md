@@ -100,15 +100,25 @@ A successful HTTP response must never claim commitment merely because the reques
 7. Retrieve and List Policies
 GET /v1/policies
 
-Returns authorized policy records.
+Returns authorized policy records sorted by id; there is no pagination.
+`include_inactive=1` includes revoked and expired records.
 
-The final contract must define pagination, ordering, filtering, and consistency semantics.
+Consistency semantics (implemented): the read is linearizable by default.
+On the leader, a quorum-confirmed heartbeat round (ReadIndex) precedes the
+read. A follower forwards the request to the leader once, responds 307
+toward the leader's admin address when it cannot proxy, or responds 503
+when no leader is reachable — a linearizable read is never silently
+downgraded. `?consistency=stale` serves this node's local, possibly-lagging
+FSM instead; the caller accepts that lag explicitly. The response carries
+the `revision` the answer is valid at.
 
 GET /v1/policies/{id}
 
 Returns the specified policy or a documented not-found response.
 
-The response should include its target, type, lifecycle metadata, and authoritative revision where available.
+The response includes its target, type, lifecycle metadata, and revision.
+Consistency semantics are identical to GET /v1/policies (linearizable by
+default, `consistency=stale` opt-in).
 
 8. Revoke a Policy
 DELETE /v1/policies/{id}
@@ -121,10 +131,17 @@ The contract must define whether the response means the revocation was accepted,
 
 9. Policy Decision Lookup
 GET /v1/decisions/{ip}
+(implementation route: GET /v1/blocked/{ip})
 
 Returns a policy decision for a validated IP address.
 
-The contract must specify whether the response reflects authoritative control-plane state or a particular local projection. It must not imply that all gateways share the same installed revision.
+The response reflects authoritative control-plane state by default: the
+read is linearizable (leader confirms via ReadIndex; followers forward,
+redirect, or respond 503), and the `revision` field states which revision
+the answer is valid at. `?consistency=stale` returns the node's local
+projection, which may lag the leader. The response does not imply that all
+gateways share the same installed revision — gateway installation is
+tracked separately by the fleet/verification path.
 
 10. Idempotency
 
