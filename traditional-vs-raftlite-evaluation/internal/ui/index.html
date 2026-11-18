@@ -113,10 +113,7 @@
     <div class="panel">
       <h2>2 · Experiment</h2>
       <label>Experiment</label>
-      <select id="expSel" onchange="renderExpDesc()">
-        <option value="propagation">Propagation latency</option>
-        <option value="consistency">Consistency (correctness)</option>
-      </select>
+      <select id="expSel" onchange="renderExpDesc()"></select>
       <div class="muted" id="expDesc" style="font-size:12px;margin-top:6px"></div>
       <label>Dataset</label>
       <select id="dsSel"><option>loading…</option></select>
@@ -266,6 +263,16 @@ async function stopEnv() {
 // ---------- experiments ----------
 async function loadExperiments() {
   state.exps = await api("/api/experiments");
+  const sel = $("expSel");
+  const prev = sel.value;
+  sel.innerHTML = "";
+  for (const e of state.exps) {
+    const o = document.createElement("option");
+    o.value = e.id;
+    o.textContent = e.name;
+    sel.appendChild(o);
+  }
+  if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
   renderExpDesc();
 }
 function renderExpDesc() {

@@ -39,6 +39,18 @@ traditional-vs-raftlite-evaluation/
 └── results/          # raw CSVs (results/raw/) + processed outputs
 ```
 
+## One-command full run (Linux/macOS)
+
+```sh
+cd traditional-vs-raftlite-evaluation
+make run-all                 # defaults: policies-100.json, 10/s
+DATASET=policies-1000.json RATE=20 make run-all
+```
+
+This builds all binaries, runs every experiment once on both systems, and
+writes a single consolidated file: `results/all-runs.json` (plus the
+aggregated `results/summary.csv`).
+
 ## Quickstart (Windows PowerShell)
 
 ```powershell
